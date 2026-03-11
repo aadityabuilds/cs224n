@@ -42,19 +42,23 @@ logging.getLogger("datasets").setLevel(logging.WARNING)
 logger = logging.getLogger("main")
 
 
-def build_system_prompt_with_rag(rag_db: RAGDatabase, problem_description: str, top_k: int = 3) -> str | None:
-    """Query RAG and build system prompt with retrieved knowledge chunks."""
+def build_system_prompt_with_rag(rag_db: RAGDatabase, problem_description: str, top_k: int = 3) -> tuple[str | None, list[int]]:
+    """Query RAG and build system prompt with retrieved knowledge chunks.
+    Returns (system_prompt, list_of_retrieved_chunk_ids).
+    """
     if rag_db.size == 0:
-        return None
-    chunks = rag_db.query(problem_description, top_k=top_k)
-    if not chunks:
-        return None
-    rag_context = "\n\n".join(f"[Knowledge {i+1}]: {c}" for i, c in enumerate(chunks))
-    return (
+        return None, []
+    results = rag_db.query_with_ids(problem_description, top_k=top_k)
+    if not results:
+        return None, []
+    retrieved_ids = [r[0] for r in results]
+    rag_context = "\n\n".join(f"[Knowledge {i+1} (id={r[0]}, score={r[2]:.3f})]: {r[1]}" for i, r in enumerate(results))
+    prompt = (
         "You are a coding expert. Here is some relevant knowledge that may help:\n\n"
         f"{rag_context}\n\n"
         "Use this knowledge if relevant to the problem."
     )
+    return prompt, retrieved_ids
 
 
 def run_training_loop(config: AgentConfig, checkpoint_callback=None):
@@ -98,7 +102,9 @@ def run_training_loop(config: AgentConfig, checkpoint_callback=None):
         logger.info(f"{'='*60}")
 
         # Step 1: Build prompt with RAG context
-        rag_system = build_system_prompt_with_rag(rag_db, description or problem[:500], config.rag_top_k)
+        rag_system, retrieved_ids = build_system_prompt_with_rag(rag_db, description or problem[:500], config.rag_top_k)
+        if retrieved_ids:
+            logger.info(f"RAG retrieved chunk IDs: {retrieved_ids}")
         code_prompt = CODE_PROMPT.format(problem=problem)
 
         # Step 2: Generate code solution
@@ -136,6 +142,7 @@ def run_training_loop(config: AgentConfig, checkpoint_callback=None):
             "accuracy": accuracy,
             "action": action,
             "rag_db_size": rag_db.size,
+            "rag_retrieved_ids": retrieved_ids,
             "running_avg_score": total_score / (idx + 1),
         }
 
@@ -153,7 +160,9 @@ def run_training_loop(config: AgentConfig, checkpoint_callback=None):
         elif action == "rag":
             logger.info(f"Adding to RAG database: {payload[:100] if payload else 'empty'}...")
             if payload:
-                rag_db.add(payload)
+                chunk_id = rag_db.add(payload)
+                step_metrics["rag_added_id"] = chunk_id
+                logger.info(f"RAG chunk stored with id={chunk_id}")
             step_metrics["rag_chunk"] = payload
         else:
             logger.info("Passing (no action needed)")
@@ -181,6 +190,10 @@ def run_training_loop(config: AgentConfig, checkpoint_callback=None):
             rag_path = f"checkpoints/{ckpt_name}_rag.json"
             with open(rag_path, "w") as f:
                 json.dump(rag_db.texts, f, indent=2)
+            # Save RAG ID -> text mapping
+            rag_map_path = f"checkpoints/{ckpt_name}_rag_id_map.json"
+            with open(rag_map_path, "w") as f:
+                json.dump({str(k): v for k, v in rag_db.id_to_text.items()}, f, indent=2)
             logger.info(f"Checkpoint saved: {ckpt_path} (RAG: {rag_db.size} chunks)")
             # Call checkpoint callback if provided
             if checkpoint_callback:

@@ -99,7 +99,11 @@ def run_training_and_eval():
         # Copy RAG db
         if os.path.exists(rag_path):
             shutil.copy(rag_path, f"{dst}/rag_db.json")
-        # Copy metrics
+        # Copy RAG ID map
+        rag_map_path = rag_path.replace("_rag.json", "_rag_id_map.json")
+        if os.path.exists(rag_map_path):
+            shutil.copy(rag_map_path, f"{dst}/rag_id_map.json")
+        # Copy metrics (includes rag_retrieved_ids per step)
         with open(f"{dst}/metrics.json", "w") as f:
             json.dump(metrics, f, indent=2)
         # Commit volume so data persists
@@ -171,7 +175,7 @@ def run_training_and_eval():
     volumes={VOLUME_PATH: volume},
     memory=32768,
 )
-def run_eval_only(checkpoint_step: int = None, num_eval_problems: int = 50):
+def run_eval_only(checkpoint_step: int = None, num_eval_problems: int = 100, only_base_and_full: bool = False):
     """Run only evaluation from a persisted checkpoint on the volume."""
     import json
     import logging
@@ -228,6 +232,7 @@ def run_eval_only(checkpoint_step: int = None, num_eval_problems: int = 50):
         trained_model_path=local_model,
         rag_db_path=local_rag,
         config=config,
+        only_base_and_full=only_base_and_full,
     )
 
     # Save to volume

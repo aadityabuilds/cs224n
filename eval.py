@@ -127,7 +127,8 @@ def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
 
 def run_eval(trained_model_path: str = "checkpoints/final_model",
              rag_db_path: str = "checkpoints/rag_db.json",
-             config: AgentConfig = None):
+             config: AgentConfig = None,
+             only_base_and_full: bool = False):
     if config is None:
         config = AgentConfig()
 
@@ -170,27 +171,27 @@ def run_eval(trained_model_path: str = "checkpoints/final_model",
             rag_db.add(chunk)
         logger.info(f"RAG database loaded with {rag_db.size} chunks")
 
-    # 2. Model + SDPO only (trained model, no RAG)
-    logger.info("\n\n=== Evaluation 2: MODEL + SDPO ONLY ===")
-    sdpo_metrics = evaluate_model(trained_model, test_dataset, config, rag_db=None, label="model+sdpo")
-    all_eval_results["model+sdpo"] = sdpo_metrics
+    if not only_base_and_full:
+        # 2. Model + SDPO only (trained model, no RAG)
+        logger.info("\n\n=== Evaluation 2: MODEL + SDPO ONLY ===")
+        sdpo_metrics = evaluate_model(trained_model, test_dataset, config, rag_db=None, label="model+sdpo")
+        all_eval_results["model+sdpo"] = sdpo_metrics
 
-    # 3. Model + RAG only (base model weights with RAG)
-    if rag_db and rag_db.size > 0:
-        logger.info("\n\n=== Evaluation 3: MODEL + RAG ONLY ===")
-        # Reload base model for RAG-only eval
-        base_for_rag = AgentModel(
-            model_name=config.model_name,
-            lr=config.lr,
-            ema_rate=config.ema_rate,
-        )
-        rag_only_metrics = evaluate_model(base_for_rag, test_dataset, config, rag_db=rag_db, label="model+rag")
-        all_eval_results["model+rag"] = rag_only_metrics
-        del base_for_rag
-        torch.cuda.empty_cache()
-    else:
-        logger.info("No RAG database available, skipping model+rag evaluation")
-        all_eval_results["model+rag"] = {"label": "model+rag", "note": "no RAG data available"}
+        # 3. Model + RAG only (base model weights with RAG)
+        if rag_db and rag_db.size > 0:
+            logger.info("\n\n=== Evaluation 3: MODEL + RAG ONLY ===")
+            base_for_rag = AgentModel(
+                model_name=config.model_name,
+                lr=config.lr,
+                ema_rate=config.ema_rate,
+            )
+            rag_only_metrics = evaluate_model(base_for_rag, test_dataset, config, rag_db=rag_db, label="model+rag")
+            all_eval_results["model+rag"] = rag_only_metrics
+            del base_for_rag
+            torch.cuda.empty_cache()
+        else:
+            logger.info("No RAG database available, skipping model+rag evaluation")
+            all_eval_results["model+rag"] = {"label": "model+rag", "note": "no RAG data available"}
 
     # 4. Full system: Model + RAG + SDPO
     logger.info("\n\n=== Evaluation 4: MODEL + RAG + SDPO (Full System) ===")
