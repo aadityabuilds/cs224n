@@ -22,9 +22,8 @@ SDPO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SDPO")
 sys.path.insert(0, SDPO_PATH)
 
 from data.utils.livecodebench import load_livecodebench
-from data.format.prompts import CODE_PROMPT
 
-from agent.config import AgentConfig, SelfDistillationConfig
+from agent.config import AgentConfig, SelfDistillationConfig, build_code_prompt
 from agent.model import AgentModel
 from agent.verification import verify_solution
 from agent.router import llm_route_decision
@@ -120,7 +119,7 @@ def run_training_loop(config: AgentConfig, checkpoint_callback=None):
         )
         if retrieved_ids:
             logger.info(f"[Sample {idx+1}] RAG context: retrieved chunk IDs {retrieved_ids}")
-        code_prompt = CODE_PROMPT.format(problem=problem)
+        code_prompt = build_code_prompt(problem, tests_json)
 
         responses, _, _ = agent_model.generate(
             prompt=code_prompt,
@@ -130,6 +129,7 @@ def run_training_loop(config: AgentConfig, checkpoint_callback=None):
             max_new_tokens=config.max_new_tokens,
         )
         response = responses[0]
+        logger.info(f"[Sample {idx+1}] RESPONSE  | {response[:1500]}")
 
         # ---- Phase 2: Verify ----
         result = verify_solution(response, tests_json)

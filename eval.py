@@ -16,9 +16,8 @@ SDPO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SDPO")
 sys.path.insert(0, SDPO_PATH)
 
 from data.utils.livecodebench import load_livecodebench
-from data.format.prompts import CODE_PROMPT
 
-from agent.config import AgentConfig
+from agent.config import AgentConfig, build_code_prompt
 from agent.model import AgentModel
 from agent.verification import verify_solution
 from agent.rag import RAGDatabase
@@ -77,7 +76,7 @@ def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
                     "Use this knowledge if relevant to the problem."
                 )
 
-        code_prompt = CODE_PROMPT.format(problem=problem)
+        code_prompt = build_code_prompt(problem, tests_json)
 
         # Generate (possibly multiple samples)
         responses, _, _ = agent_model.generate(

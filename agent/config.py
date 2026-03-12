@@ -1,5 +1,34 @@
 """Configuration dataclasses for the self-evolving agent."""
+import json
 from dataclasses import dataclass
+
+_PROMPT_STDIN = (
+    "You are a coding expert. You will be given a coding problem, and you need "
+    "to write a correct Python program that matches the specification and passes "
+    "all tests. The function should take stdin as input and print the output. "
+    "Simply call the function after the definition. Please provide the complete "
+    "code in a code block enclosed with ``` ```.\n\n{problem}"
+)
+
+_PROMPT_FUNCTIONAL = (
+    "You are a coding expert. You will be given a coding problem, and you need "
+    "to write a correct Python program that matches the specification and passes "
+    "all tests. Write a standalone Python function — do NOT put it inside a "
+    "class. If the problem signature includes `self`, remove it. Return the "
+    "function body without invoking it. Please provide the complete code in a "
+    "code block enclosed with ``` ```.\n\n{problem}"
+)
+
+
+def build_code_prompt(problem: str, tests_json: str) -> str:
+    """Select the right prompt template based on test type."""
+    try:
+        tc = json.loads(tests_json)
+        if tc.get("testtype") == "functional":
+            return _PROMPT_FUNCTIONAL.format(problem=problem)
+    except (json.JSONDecodeError, AttributeError, TypeError):
+        pass
+    return _PROMPT_STDIN.format(problem=problem)
 
 
 @dataclass
@@ -17,7 +46,9 @@ class SelfDistillationConfig:
     # Add tail probability bucket for top-k (recommended)
     distillation_add_tail: bool = True
     # Minimum reward to count as a successful demonstration
-    success_reward_threshold: float = 0.5
+    # Lower threshold means partial solutions count as demos, giving the teacher
+    # something to condition on. Too high = no demos found = no learning.
+    success_reward_threshold: float = 0.1
     # Don't use a rollout's own success as its demonstration
     dont_reprompt_on_self_success: bool = True
     # Strip <think>...</think> from demonstrations

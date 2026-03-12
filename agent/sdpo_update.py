@@ -215,6 +215,7 @@ def sdpo_batch_step(agent_model, batch_items: list[dict], verify_fn,
             fb_short = (result.get('feedback', '') or 'passed')[:80]
             logger.info(f"    rollout {i}/{G}: score={result['score']:.3f}  "
                         f"acc={result['acc']:.3f}  feedback={fb_short}")
+            logger.info(f"    rollout {i}/{G} response: {resp_text[:800]}")
 
         # Summarize rollouts for this problem
         num_passing = sum(1 for r in rewards if r >= sdpo_config.success_reward_threshold)
@@ -248,8 +249,9 @@ def sdpo_batch_step(agent_model, batch_items: list[dict], verify_fn,
         if has_feedback:
             logger.info(f"    feedback available: {(fail_feedback or '')[:150]}")
 
-        if not has_demo and not has_feedback:
-            logger.info(f"    SKIPPED: no demonstration and no usable feedback")
+        if not has_demo:
+            logger.info(f"    SKIPPED: no demonstration found — teacher has no informational "
+                        f"advantage without a correct answer to condition on")
             continue
 
         # Build reprompted teacher prompt
@@ -395,12 +397,21 @@ def sdpo_batch_step(agent_model, batch_items: list[dict], verify_fn,
             'problem_loss': problem_loss,
         })
 
+    # Skip optimizer step entirely if no rollouts were distilled
+    if total_rollouts_used == 0:
+        logger.info("  SDPO batch: no rollouts distilled (no demos found) — skipping optimizer step")
+        return {
+            'sdpo_loss': 0.0,
+            'num_problems_updated': 0,
+            'num_rollouts_used': 0,
+            'skipped': True,
+        }
+
     # Scale gradients by 1/total_rollouts_used (average across all rollouts)
-    if total_rollouts_used > 0:
-        scale = 1.0 / total_rollouts_used
-        for param in agent_model.student.parameters():
-            if param.grad is not None:
-                param.grad.mul_(scale)
+    scale = 1.0 / total_rollouts_used
+    for param in agent_model.student.parameters():
+        if param.grad is not None:
+            param.grad.mul_(scale)
 
     # ------------------------------------------------------------------
     # Phase 3: Optimizer step + EMA update
