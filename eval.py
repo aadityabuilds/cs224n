@@ -112,9 +112,9 @@ def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
         n = idx + 1
         if n % 5 == 0 or n == num_problems:
             logger.info(f"[{label}] {n}/{num_problems} | "
-                        f"Score: {score:.3f} | "
-                        f"Acc avg: {total_accuracy/n:.3f} | "
-                        f"Solve: {total_correct}/{n}")
+                        f"This: {score:.3f} | "
+                        f"Test-case acc: {total_accuracy/n:.3f} | "
+                        f"Solve rate: {total_correct}/{n} ({total_correct/n:.3f})")
 
     avg_accuracy = total_accuracy / max(num_problems, 1)
     solve_rate = total_correct / max(num_problems, 1)
@@ -123,16 +123,18 @@ def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
         "label": label,
         "num_problems": num_problems,
         "num_samples": num_samples,
+        "avg_test_case_accuracy": avg_accuracy,
         "avg_score": avg_accuracy,
         "avg_accuracy": avg_accuracy,
+        "solve_rate": solve_rate,
         "pass_rate": solve_rate,
         "num_correct": total_correct,
         "results": results,
     }
 
     logger.info(f"\n--- {label} Results ---")
-    logger.info(f"  Accuracy avg (tests passed): {avg_accuracy:.4f}")
-    logger.info(f"  Solve rate (fully correct):  {solve_rate:.4f} ({total_correct}/{num_problems})")
+    logger.info(f"  Test-case accuracy (avg % tests passed per problem): {avg_accuracy:.4f}")
+    logger.info(f"  Solve rate (100% correct problems):                  {solve_rate:.4f} ({total_correct}/{num_problems})")
 
     return metrics
 
@@ -215,19 +217,21 @@ def run_eval(trained_model_path: str = "checkpoints/final_model",
             all_eval_results["model+rag"] = {"label": "model+rag", "note": "no RAG data available"}
 
     # Print final comparison
-    logger.info("\n\n" + "=" * 70)
+    logger.info("\n\n" + "=" * 80)
     logger.info("FINAL COMPARISON")
-    logger.info("=" * 70)
-    logger.info(f"{'Configuration':<25} {'Avg Score':>12} {'Pass Rate':>12} {'Correct':>10}")
-    logger.info("-" * 70)
+    logger.info("=" * 80)
+    logger.info(f"{'Configuration':<25} {'Test-Case Acc':>14} {'Solve Rate':>12} {'Correct':>10}")
+    logger.info("-" * 80)
     for key in ["model+rag+sdpo", "base_qwen", "model+sdpo", "model+rag"]:
         m = all_eval_results.get(key, {})
         if "avg_score" in m:
-            logger.info(f"{m['label']:<25} {m['avg_score']:>12.4f} {m['pass_rate']:>12.4f} "
+            logger.info(f"{m['label']:<25} {m['avg_score']:>14.4f} {m['pass_rate']:>12.4f} "
                         f"{m['num_correct']:>5}/{m['num_problems']}")
         else:
-            logger.info(f"{key:<25} {'N/A':>12} {'N/A':>12} {'N/A':>10}")
-    logger.info("=" * 70)
+            logger.info(f"{key:<25} {'N/A':>14} {'N/A':>12} {'N/A':>10}")
+    logger.info("=" * 80)
+    logger.info("Test-Case Acc = avg fraction of test cases passed per problem")
+    logger.info("Solve Rate    = fraction of problems fully solved (100% test cases)")
 
     # Save results
     with open("eval_results.json", "w") as f:
