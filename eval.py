@@ -2,8 +2,8 @@
 
 Evaluates on the test split of LiveCodeBench:
 1. Base Qwen model (no training, no RAG)
-2. Model + RAG only (no SDPO training, but with RAG context)
-3. Model + SDPO only (SDPO-trained model, no RAG context)
+2. Model + SDPO only (SDPO-trained model, no RAG context)
+3. Model + RAG only (base model weights with RAG)
 4. Model + RAG + SDPO (full system)
 """
 import json
@@ -39,10 +39,18 @@ logger = logging.getLogger("eval")
 
 
 def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
-                   rag_db: RAGDatabase = None, label: str = "model") -> dict:
-    """Evaluate a model on the test dataset. Returns metrics dict."""
+                   rag_db: RAGDatabase = None, label: str = "model",
+                   num_samples: int = 1, temperature: float = 0.0) -> dict:
+    """Evaluate a model on the test dataset.
+
+    Args:
+        num_samples: number of samples per problem (1=greedy, >1=avg@N)
+        temperature: sampling temperature (0=greedy)
+
+    Returns metrics dict.
+    """
     logger.info(f"\n{'='*60}")
-    logger.info(f"EVALUATING: {label}")
+    logger.info(f"EVALUATING: {label} (samples={num_samples}, temp={temperature})")
     logger.info(f"{'='*60}")
 
     total_score = 0.0
@@ -71,20 +79,28 @@ def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
 
         code_prompt = CODE_PROMPT.format(problem=problem)
 
-        # Generate
+        # Generate (possibly multiple samples)
         responses, _, _ = agent_model.generate(
             prompt=code_prompt,
             system_prompt=system_prompt,
-            num_return_sequences=1,
-            temperature=0.0,
+            num_return_sequences=num_samples,
+            temperature=temperature,
             max_new_tokens=config.max_new_tokens,
         )
-        response = responses[0]
 
-        # Verify (use test split for sparse rewards)
-        result = verify_solution(response, tests_json, split="test")
-        score = result["score"]
-        acc = result["acc"]
+        # Score all samples, take best (pass@N) or average (avg@N)
+        best_score = 0.0
+        best_acc = 0.0
+        sample_scores = []
+        for resp in responses:
+            result = verify_solution(resp, tests_json, split="test")
+            sample_scores.append(result["score"])
+            if result["score"] > best_score:
+                best_score = result["score"]
+                best_acc = result["acc"]
+
+        score = best_score
+        acc = best_acc
         total_score += score
         total_acc += acc
         if score > 0.99:
@@ -94,7 +110,8 @@ def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
             "step": idx + 1,
             "score": score,
             "acc": acc,
-            "feedback": result["feedback"][:200] if result["feedback"] else "passed",
+            "sample_scores": sample_scores,
+            "feedback": result["feedback"][:200] if result.get("feedback") else "passed",
         })
 
         if (idx + 1) % 5 == 0 or (idx + 1) == num_problems:
@@ -103,13 +120,14 @@ def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
                         f"Running avg: {total_score/(idx+1):.3f} | "
                         f"Correct: {num_correct}/{idx+1}")
 
-    avg_score = total_score / num_problems
-    avg_acc = total_acc / num_problems
-    pass_rate = num_correct / num_problems
+    avg_score = total_score / max(num_problems, 1)
+    avg_acc = total_acc / max(num_problems, 1)
+    pass_rate = num_correct / max(num_problems, 1)
 
     metrics = {
         "label": label,
         "num_problems": num_problems,
+        "num_samples": num_samples,
         "avg_score": avg_score,
         "avg_accuracy": avg_acc,
         "pass_rate": pass_rate,
@@ -147,7 +165,6 @@ def run_eval(trained_model_path: str = "checkpoints/final_model",
     )
     base_metrics = evaluate_model(base_model, test_dataset, config, rag_db=None, label="base_qwen")
     all_eval_results["base_qwen"] = base_metrics
-    # Free base model memory
     del base_model
     import torch
     torch.cuda.empty_cache()
@@ -172,12 +189,12 @@ def run_eval(trained_model_path: str = "checkpoints/final_model",
         logger.info(f"RAG database loaded with {rag_db.size} chunks")
 
     if not only_base_and_full:
-        # 2. Model + SDPO only (trained model, no RAG)
+        # 2. Model + SDPO only
         logger.info("\n\n=== Evaluation 2: MODEL + SDPO ONLY ===")
         sdpo_metrics = evaluate_model(trained_model, test_dataset, config, rag_db=None, label="model+sdpo")
         all_eval_results["model+sdpo"] = sdpo_metrics
 
-        # 3. Model + RAG only (base model weights with RAG)
+        # 3. Model + RAG only (base weights)
         if rag_db and rag_db.size > 0:
             logger.info("\n\n=== Evaluation 3: MODEL + RAG ONLY ===")
             base_for_rag = AgentModel(
@@ -193,7 +210,7 @@ def run_eval(trained_model_path: str = "checkpoints/final_model",
             logger.info("No RAG database available, skipping model+rag evaluation")
             all_eval_results["model+rag"] = {"label": "model+rag", "note": "no RAG data available"}
 
-    # 4. Full system: Model + RAG + SDPO
+    # 4. Full system
     logger.info("\n\n=== Evaluation 4: MODEL + RAG + SDPO (Full System) ===")
     full_metrics = evaluate_model(trained_model, test_dataset, config, rag_db=rag_db, label="model+rag+sdpo")
     all_eval_results["model+rag+sdpo"] = full_metrics

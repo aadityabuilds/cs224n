@@ -1,16 +1,17 @@
 [project]
 name = "cs224n"
 version = "0.1.0"
-description = "Add your description here"
+description = "Self-evolving SDPO agent for LiveCodeBench"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.11"
 dependencies = [
     "torch>=2.0.0",
-    "transformers>=4.40.0",
+    "transformers>=4.45.0",
     "accelerate>=0.30.0",
     "datasets>=2.18.0",
     "numpy>=1.24.0",
     "faiss-cpu>=1.7.0",
     "sentence-transformers>=2.2.0",
+    "huggingface_hub",
     "modal",
 ]

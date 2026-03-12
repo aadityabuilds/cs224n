@@ -1,7 +1,15 @@
-"""Model loading, generation, log-prob computation, and EMA teacher management."""
+"""Model loading, generation, log-prob computation, and EMA teacher management.
+
+Key design decisions:
+- Generation returns raw token IDs (no decode→re-encode lossy round-trip)
+- Teacher forward uses DIFFERENT prompt (reprompted with demonstrations/feedback)
+- Top-k logit extraction for memory-efficient full-logit distillation
+- Sequential rollout processing with gradient accumulation for memory efficiency
+"""
 import copy
 import logging
 import torch
+import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 logger = logging.getLogger(__name__)
@@ -21,7 +29,6 @@ class AgentModel:
         self.student = AutoModelForCausalLM.from_pretrained(
             model_name, torch_dtype=torch.bfloat16, device_map=device
         )
-        # Enable gradient checkpointing to save memory during backward
         self.student.gradient_checkpointing_enable()
         self.student.train()
 
@@ -35,20 +42,39 @@ class AgentModel:
         self.optimizer = torch.optim.AdamW(self.student.parameters(), lr=lr)
         logger.info("AgentModel initialized.")
 
-    def generate(self, prompt: str, system_prompt: str = None,
-                 num_return_sequences: int = 1, temperature: float = 0.0,
-                 max_new_tokens: int = 2048):
-        """Generate text from the student model. Returns (decoded_texts, prompt_ids, generated_ids)."""
+    # ------------------------------------------------------------------
+    # Tokenization helpers
+    # ------------------------------------------------------------------
+
+    def tokenize_chat(self, prompt: str, system_prompt: str = None) -> torch.Tensor:
+        """Tokenize a prompt using the chat template. Returns (prompt_len,) tensor on device."""
         messages = []
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": prompt})
-
         text = self.tokenizer.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True
         )
-        inputs = self.tokenizer([text], return_tensors="pt").to(self.device)
-        prompt_len = inputs.input_ids.shape[1]
+        ids = self.tokenizer.encode(text, return_tensors="pt")[0]
+        return ids.to(self.device)
+
+    # ------------------------------------------------------------------
+    # Generation
+    # ------------------------------------------------------------------
+
+    def generate(self, prompt: str, system_prompt: str = None,
+                 num_return_sequences: int = 1, temperature: float = 0.0,
+                 max_new_tokens: int = 2048):
+        """Generate from the student model.
+
+        Returns:
+            decoded: list[str] of decoded response texts
+            prompt_ids: (prompt_len,) token IDs of the prompt
+            response_ids_list: list of (resp_len_i,) tensors — raw token IDs per response
+        """
+        prompt_ids = self.tokenize_chat(prompt, system_prompt)
+        input_ids = prompt_ids.unsqueeze(0)  # (1, prompt_len)
+        prompt_len = prompt_ids.shape[0]
 
         do_sample = temperature > 0 and num_return_sequences > 1
         gen_kwargs = dict(
@@ -63,80 +89,127 @@ class AgentModel:
         with torch.no_grad():
             self.student.eval()
             self.student.gradient_checkpointing_disable()
-            output_ids = self.student.generate(**inputs, **gen_kwargs)
+            output_ids = self.student.generate(input_ids, **gen_kwargs)
             self.student.gradient_checkpointing_enable()
             self.student.train()
 
-        prompt_ids = inputs["input_ids"][:1, :]  # (1, prompt_len)
-        generated_ids = output_ids[:, prompt_len:]  # (N, gen_len)
+        # Split into per-sequence response token IDs
+        response_ids_list = []
+        decoded = []
+        for i in range(output_ids.shape[0]):
+            resp_ids = output_ids[i, prompt_len:]
+            # Trim at first EOS token (keep the EOS)
+            eos_positions = (resp_ids == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
+            if len(eos_positions) > 0:
+                resp_ids = resp_ids[:eos_positions[0] + 1]
+            response_ids_list.append(resp_ids)
+            decoded.append(self.tokenizer.decode(resp_ids, skip_special_tokens=True))
 
-        decoded = [
-            self.tokenizer.decode(generated_ids[i], skip_special_tokens=True)
-            for i in range(generated_ids.shape[0])
-        ]
-        return decoded, prompt_ids, generated_ids
+        return decoded, prompt_ids, response_ids_list
 
-    def compute_log_probs_single(self, model, prompt_text: str, response_text: str,
-                                 system_prompt: str = None):
-        """Compute per-token log-probs for a single response. Returns (log_probs, mask) both (1, resp_len)."""
-        messages = []
-        if system_prompt:
-            messages.append({"role": "system", "content": system_prompt})
-        messages.append({"role": "user", "content": prompt_text})
+    # ------------------------------------------------------------------
+    # Forward passes for SDPO distillation
+    # ------------------------------------------------------------------
 
-        text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True
-        )
-        prompt_ids = self.tokenizer.encode(text, return_tensors="pt")[0]
-        resp_ids = self.tokenizer.encode(response_text, add_special_tokens=False, return_tensors="pt")[0]
-        full_ids = torch.cat([prompt_ids, resp_ids]).unsqueeze(0).to(self.device)
+    def forward_teacher_topk(self, prompt_ids: torch.Tensor, response_ids: torch.Tensor,
+                              topk: int = 100):
+        """No-grad teacher forward pass. Returns top-k log-probs at teacher's chosen indices.
+
+        Args:
+            prompt_ids: (prompt_len,) teacher prompt token IDs (may be reprompted)
+            response_ids: (resp_len,) response token IDs from student generation
+            topk: number of top logits to extract
+
+        Returns:
+            teacher_token_lp: (resp_len,) log-prob of actual response tokens
+            teacher_topk_lp: (resp_len, topk) top-k log-probs
+            teacher_topk_idx: (resp_len, topk) token indices for top-k
+        """
+        full_ids = torch.cat([prompt_ids, response_ids]).unsqueeze(0)  # (1, seq_len)
         p_len = len(prompt_ids)
-        r_len = len(resp_ids)
+        r_len = len(response_ids)
+
+        with torch.no_grad():
+            outputs = self.teacher(input_ids=full_ids)
+            logits = outputs.logits[0]  # (seq_len, vocab_size)
+
+        # Logits predicting response tokens: positions p_len-1 to p_len+r_len-2
+        resp_logits = logits[p_len - 1: p_len + r_len - 1]  # (r_len, vocab_size)
+        log_probs = F.log_softmax(resp_logits.float(), dim=-1)
+
+        # Per-token log-prob of actual generated tokens
+        teacher_token_lp = log_probs.gather(
+            dim=-1, index=response_ids.unsqueeze(-1)
+        ).squeeze(-1)  # (r_len,)
+
+        # Top-k extraction
+        k = min(topk, log_probs.shape[-1])
+        teacher_topk_lp, teacher_topk_idx = torch.topk(log_probs, k=k, dim=-1)
+
+        return teacher_token_lp, teacher_topk_lp, teacher_topk_idx
+
+    def forward_student_at_teacher_topk(self, prompt_ids: torch.Tensor,
+                                         response_ids: torch.Tensor,
+                                         teacher_topk_idx: torch.Tensor):
+        """With-grad student forward. Gathers log-probs at teacher's top-k indices.
+
+        Args:
+            prompt_ids: (prompt_len,) original student prompt token IDs
+            response_ids: (resp_len,) response token IDs
+            teacher_topk_idx: (resp_len, topk) indices from teacher's top-k
+
+        Returns:
+            student_token_lp: (resp_len,) log-prob of actual response tokens (with grad)
+            student_gathered_lp: (resp_len, topk) log-probs at teacher's top-k indices (with grad)
+        """
+        full_ids = torch.cat([prompt_ids, response_ids]).unsqueeze(0)  # (1, seq_len)
+        p_len = len(prompt_ids)
+        r_len = len(response_ids)
+
+        outputs = self.student(input_ids=full_ids)
+        logits = outputs.logits[0]  # (seq_len, vocab_size)
+
+        resp_logits = logits[p_len - 1: p_len + r_len - 1]  # (r_len, vocab_size)
+        log_probs = F.log_softmax(resp_logits.float(), dim=-1)
+
+        # Per-token log-prob of actual generated tokens
+        student_token_lp = log_probs.gather(
+            dim=-1, index=response_ids.unsqueeze(-1)
+        ).squeeze(-1)  # (r_len,)
+
+        # Gather at teacher's top-k indices (keeps gradient flow)
+        student_gathered_lp = log_probs.gather(dim=-1, index=teacher_topk_idx)  # (r_len, topk)
+
+        return student_token_lp, student_gathered_lp
+
+    # ------------------------------------------------------------------
+    # Simple log-prob computation (for routing / evaluation, no logit extraction)
+    # ------------------------------------------------------------------
+
+    def compute_log_probs_single(self, model, prompt_ids: torch.Tensor,
+                                  response_ids: torch.Tensor):
+        """Compute per-token log-probs for a single response using raw token IDs.
+
+        Returns (log_probs, mask) both (resp_len,).
+        """
+        full_ids = torch.cat([prompt_ids, response_ids]).unsqueeze(0)
+        p_len = len(prompt_ids)
+        r_len = len(response_ids)
 
         outputs = model(input_ids=full_ids)
-        logits = outputs.logits  # (1, seq_len, vocab)
+        logits = outputs.logits[0]
+        resp_logits = logits[p_len - 1: p_len + r_len - 1]
+        log_probs = F.log_softmax(resp_logits.float(), dim=-1)
+        per_token_lp = log_probs.gather(
+            dim=-1, index=response_ids.unsqueeze(-1)
+        ).squeeze(-1)
 
-        # Shift: predict token t from position t-1
-        shift_logits = logits[:, :-1, :]
-        shift_labels = full_ids[:, 1:]
+        mask = torch.ones(r_len, device=self.device, dtype=torch.float32)
+        return per_token_lp.float(), mask
 
-        log_probs_all = torch.log_softmax(shift_logits.float(), dim=-1)
-        per_token_lp = torch.gather(
-            log_probs_all, dim=-1, index=shift_labels.unsqueeze(-1)
-        ).squeeze(-1)  # (1, seq_len-1)
-
-        # Extract response portion
-        start = p_len - 1
-        resp_log_probs = per_token_lp[:, start:start + r_len]  # (1, r_len)
-        resp_mask = torch.ones_like(resp_log_probs)
-
-        # Keep float32 for numerical precision in loss computation
-        return resp_log_probs.float(), resp_mask.float()
-
-    def compute_log_probs(self, model, prompt_text: str, response_texts: list[str],
-                          system_prompt: str = None):
-        """Compute per-token log-probs sequentially (one response at a time to save memory).
-        Returns (log_probs, response_mask) both (G, max_resp_len)."""
-        all_lp = []
-        all_mask = []
-
-        for resp in response_texts:
-            lp, mask = self.compute_log_probs_single(model, prompt_text, resp, system_prompt)
-            all_lp.append(lp)
-            all_mask.append(mask)
-
-        # Pad to max response length
-        max_resp_len = max(lp.shape[1] for lp in all_lp)
-        G = len(response_texts)
-        padded_lp = torch.zeros(G, max_resp_len, device=self.device, dtype=torch.float32)
-        padded_mask = torch.zeros(G, max_resp_len, device=self.device, dtype=torch.float32)
-
-        for i in range(G):
-            r_len = all_lp[i].shape[1]
-            padded_lp[i, :r_len] = all_lp[i][0]
-            padded_mask[i, :r_len] = all_mask[i][0]
-
-        return padded_lp, padded_mask
+    # ------------------------------------------------------------------
+    # EMA & checkpointing
+    # ------------------------------------------------------------------
 
     def ema_update_teacher(self):
         """Update teacher params: teacher = (1 - rate) * teacher + rate * student."""
