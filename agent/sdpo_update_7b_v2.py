@@ -5,6 +5,11 @@ Key differences from sdpo_update_7b.py:
 - Shorter feedback truncation (300 chars) to keep 16-attempt prompts manageable
 - Same 100% accuracy condition
 """
+# This file uses code from the SDPO (Self-Distillation with Policy Optimization) framework.
+# SDPO is licensed under the Apache License, Version 2.0.
+# Copyright 2025 Hübotter, Lübeck, Behric, Baumann, Bagatella, Marta, Hakimi, Shenfeld, Kleine Buening, Guestrin, Krause
+# Source: https://github.com/lasgroup/SDPO
+# License: http://www.apache.org/licenses/LICENSE-2.0
 import gc
 import logging
 import math

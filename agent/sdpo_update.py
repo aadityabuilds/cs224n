@@ -10,6 +10,11 @@ Algorithm (v2 — fixes catastrophic forgetting):
 6. Compute top-k KL distillation loss (JSD) + reference KL anchor
 7. Single optimizer step + EMA teacher update
 """
+# This file uses code from the SDPO (Self-Distillation with Policy Optimization) framework.
+# SDPO is licensed under the Apache License, Version 2.0.
+# Copyright 2025 Hübotter, Lübeck, Behric, Baumann, Bagatella, Marta, Hakimi, Shenfeld, Kleine Buening, Guestrin, Krause
+# Source: https://github.com/lasgroup/SDPO
+# License: http://www.apache.org/licenses/LICENSE-2.0
 import logging
 import math
 import re

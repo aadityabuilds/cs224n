@@ -6,6 +6,11 @@ Key differences from modal_app_7b.py:
 - Full decision log saved to volume
 - Eval over 100 test problems
 """
+# This file uses code from the SDPO (Self-Distillation with Policy Optimization) framework.
+# SDPO is licensed under the Apache License, Version 2.0.
+# Copyright 2025 Hübotter, Lübeck, Behric, Baumann, Bagatella, Marta, Hakimi, Shenfeld, Kleine Buening, Guestrin, Krause
+# Source: https://github.com/lasgroup/SDPO
+# License: http://www.apache.org/licenses/LICENSE-2.0
 import modal
 
 app = modal.App("cs224n-7b-sdpo-v2")

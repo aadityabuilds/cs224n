@@ -1,16 +1,21 @@
-"""Sweep eval across ALL checkpoints for v2 (16 attempts).
+"""Sweep eval across ALL checkpoints for v1 (4 attempts).
 
 Discovers every step_N checkpoint on the volume, evaluates each for
 model+sdpo and model+rag+sdpo in parallel, runs baseline once, and
 prints a progression table at the end.
 
 Usage:
-  modal run eval_sweep_7b_v2.py
-  modal run eval_sweep_7b_v2.py --num-eval-problems 50
+  modal run eval_sweep_7b.py
+  modal run eval_sweep_7b.py --num-eval-problems 50
 """
+# This file uses code from the SDPO (Self-Distillation with Policy Optimization) framework.
+# SDPO is licensed under the Apache License, Version 2.0.
+# Copyright 2025 Hübotter, Lübeck, Behric, Baumann, Bagatella, Marta, Hakimi, Shenfeld, Kleine Buening, Guestrin, Krause
+# Source: https://github.com/lasgroup/SDPO
+# License: http://www.apache.org/licenses/LICENSE-2.0
 import modal
 
-app = modal.App("cs224n-7b-eval-sweep-v2")
+app = modal.App("cs224n-7b-eval-sweep")
 
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -41,7 +46,7 @@ image = (
     ])
 )
 
-volume = modal.Volume.from_name("cs224n-7b-v2-results", create_if_missing=True)
+volume = modal.Volume.from_name("cs224n-7b-results", create_if_missing=True)
 VOLUME_PATH = "/results"
 
 
@@ -71,7 +76,7 @@ def eval_one_checkpoint(checkpoint_step: int, num_eval_problems: int = 50):
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[logging.StreamHandler()], force=True,
     )
-    logger = logging.getLogger(f"sweep_v2_step{checkpoint_step}")
+    logger = logging.getLogger(f"sweep_v1_step{checkpoint_step}")
     volume.reload()
 
     vol_model = f"{VOLUME_PATH}/checkpoints/step_{checkpoint_step}/model"
@@ -89,15 +94,18 @@ def eval_one_checkpoint(checkpoint_step: int, num_eval_problems: int = 50):
     if has_rag:
         shutil.copy(vol_rag, local_rag)
 
-    from agent.model_7b import AgentModel7B
-    from agent.rag import RAGDatabase
-    from eval_7b import evaluate_model
     from data.utils.livecodebench import load_livecodebench
+    from agent.config import build_code_prompt
+    from agent.model_7b import AgentModel7B
+    from agent.verification import verify_solution
+    from agent.rag import RAGDatabase
 
     logger.info(f"Loading test dataset...")
     test_dataset = load_livecodebench("test")
 
     trained = AgentModel7B(model_name=local_model, lr=1e-6, ema_rate=0.005)
+
+    from eval_7b import evaluate_model
 
     sdpo_metrics = evaluate_model(
         trained, test_dataset, f"step{checkpoint_step}_sdpo",
@@ -141,7 +149,7 @@ def eval_one_checkpoint(checkpoint_step: int, num_eval_problems: int = 50):
     if rag_metrics:
         logger.info(f"  model+rag+sdpo: acc={rag_metrics['avg_score']:.4f}  solve={rag_metrics['pass_rate']:.4f}")
 
-    with open(f"{VOLUME_PATH}/sweep_v2_step{checkpoint_step}.json", "w") as f:
+    with open(f"{VOLUME_PATH}/sweep_v1_step{checkpoint_step}.json", "w") as f:
         json.dump(result, f, indent=2)
     volume.commit()
 
@@ -161,7 +169,7 @@ def eval_baseline(num_eval_problems: int = 50):
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[logging.StreamHandler()], force=True,
     )
-    logger = logging.getLogger("sweep_v2_baseline")
+    logger = logging.getLogger("sweep_v1_baseline")
 
     from data.utils.livecodebench import load_livecodebench
     from agent.model_7b import AgentModel7B
@@ -185,7 +193,7 @@ def eval_baseline(num_eval_problems: int = 50):
             "num_problems": base_metrics["num_problems"],
         },
     }
-    with open(f"{VOLUME_PATH}/sweep_v2_baseline.json", "w") as f:
+    with open(f"{VOLUME_PATH}/sweep_v1_baseline.json", "w") as f:
         json.dump(result, f, indent=2)
     volume.commit()
     return result
@@ -212,16 +220,16 @@ def list_checkpoints():
 
 @app.local_entrypoint()
 def main(num_eval_problems: int = 50, min_step: int = 0):
-    """Sweep eval across v2 checkpoints.
+    """Sweep eval across v1 checkpoints.
 
     Usage:
-      modal run eval_sweep_7b_v2.py
-      modal run eval_sweep_7b_v2.py --num-eval-problems 30
-      modal run eval_sweep_7b_v2.py --min-step 200   # only checkpoints after 200 (250, 300, ...)
+      modal run eval_sweep_7b.py
+      modal run eval_sweep_7b.py --num-eval-problems 30
+      modal run eval_sweep_7b.py --min-step 200   # only checkpoints after 200 (250, 300, ...)
     """
-    print("=" * 100)
-    print("  v2 CHECKPOINT SWEEP EVAL (16 attempts)")
-    print("=" * 100)
+    print("=" * 80)
+    print("  v1 CHECKPOINT SWEEP EVAL (4 attempts)")
+    print("=" * 80)
 
     all_steps = list_checkpoints.remote()
     steps = [s for s in all_steps if s > min_step] if min_step else all_steps
@@ -257,8 +265,9 @@ def main(num_eval_problems: int = 50, min_step: int = 0):
             print(f"  [WARN] Step {step} failed: {e}")
             results[step] = {"step": step, "error": str(e)}
 
+    # Print progression table
     print("\n" + "=" * 100)
-    print(f"  v2 CHECKPOINT PROGRESSION (baseline acc={base_acc:.4f}  solve={base_solve:.4f}  [{base_correct}/{base_n}])")
+    print(f"  v1 CHECKPOINT PROGRESSION (baseline acc={base_acc:.4f}  solve={base_solve:.4f}  [{base_correct}/{base_n}])")
     print("=" * 100)
     header = (f"  {'Step':>6}  |  {'SDPO Acc':>10} {'SDPO Solve':>12} {'Correct':>9}"
               f"  |  {'RAG+SDPO Acc':>13} {'RAG+SDPO Solve':>15} {'Correct':>9}")

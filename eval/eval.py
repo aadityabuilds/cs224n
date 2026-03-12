@@ -6,13 +6,20 @@ Evaluates on the test split of LiveCodeBench:
 3. Model + RAG only (base model weights with RAG)
 4. Model + RAG + SDPO (full system)
 """
+# This file uses code from the SDPO (Self-Distillation with Policy Optimization) framework.
+# SDPO is licensed under the Apache License, Version 2.0.
+# Copyright 2025 Hübotter, Lübeck, Behric, Baumann, Bagatella, Marta, Hakimi, Shenfeld, Kleine Buening, Guestrin, Krause
+# Source: https://github.com/lasgroup/SDPO
+# License: http://www.apache.org/licenses/LICENSE-2.0
 import json
 import logging
 import os
 import sys
 
-SDPO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SDPO")
+PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+SDPO_PATH = os.path.join(PROJECT_ROOT, "SDPO")
 sys.path.insert(0, SDPO_PATH)
+sys.path.insert(0, PROJECT_ROOT)
 
 from data.utils.livecodebench import load_livecodebench
 

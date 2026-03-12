@@ -1,17 +1,22 @@
-"""7B SDPO v2 — 16 sequential attempts, full decision logging.
+"""7B SDPO v3 — 32 sequential attempts, sliding feedback window, lesson-based RAG.
 
-Key differences from main_7b.py:
-- max_sequential_attempts = 16 (up from 4)
-- Every decision, attempt, and outcome logged to training_decisions.json
-- Shorter per-attempt feedback truncation (300 chars) to keep 16-attempt prompts manageable
-- sdpo_batch_size=1 to avoid OOM with longer rollouts
+Key differences from v2:
+- max_sequential_attempts = 32 (up from 16)
+- Sliding feedback window (last 6 feedbacks) to keep prompts bounded
+- RAG stores lessons/mistakes learned, not failed solutions
+- sdpo_batch_size=1 to manage time/memory with long rollouts
 """
+# This file uses code from the SDPO (Self-Distillation with Policy Optimization) framework.
+# SDPO is licensed under the Apache License, Version 2.0.
+# Copyright 2025 Hübotter, Lübeck, Behric, Baumann, Bagatella, Marta, Hakimi, Shenfeld, Kleine Buening, Guestrin, Krause
+# Source: https://github.com/lasgroup/SDPO
+# License: http://www.apache.org/licenses/LICENSE-2.0
 import json
 import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import numpy as np
 
 
@@ -27,8 +32,10 @@ class _SafeEncoder(json.JSONEncoder):
             return o.tolist()
         return super().default(o)
 
-SDPO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SDPO")
+PROJECT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+SDPO_PATH = os.path.join(PROJECT_ROOT, "SDPO")
 sys.path.insert(0, SDPO_PATH)
+sys.path.insert(0, PROJECT_ROOT)
 
 from data.utils.livecodebench import load_livecodebench
 
@@ -37,21 +44,43 @@ from agent.model_7b import AgentModel7B
 from agent.verification import verify_solution
 from agent.router import llm_route_decision
 from agent.rag import RAGDatabase
-from agent.sdpo_update_7b_v2 import sdpo_batch_step_7b_v2
+from agent.sdpo_update_7b_v3 import sdpo_batch_step_7b_v3
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("training_7b_v2.log"),
+        logging.FileHandler("training_7b_v3.log"),
     ]
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("huggingface_hub").setLevel(logging.WARNING)
 logging.getLogger("transformers").setLevel(logging.WARNING)
 logging.getLogger("datasets").setLevel(logging.WARNING)
-logger = logging.getLogger("main_7b_v2")
+logger = logging.getLogger("main_7b_v3")
+
+
+@dataclass
+class AgentConfig7Bv3:
+    """7B v3 config — 32 sequential attempts with sliding feedback window."""
+    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
+    lr: float = 2e-6
+    ema_rate: float = 0.005
+    num_rollouts: int = 2
+    max_sequential_attempts: int = 32
+    temperature: float = 0.7
+    max_new_tokens: int = 1536
+    rag_top_k: int = 3
+    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
+    max_grad_norm: float = 1.0
+    dataset_split: str = "train"
+    max_problems: int = None
+    sdpo_batch_size: int = 1
+    max_reprompt_tokens: int = 3072
+    checkpoint_every: int = 50
+    feedback_truncate: int = 250
+    feedback_window: int = 6
 
 
 RAG_LESSON_PROMPT = """You are analyzing a coding mistake to extract a reusable lesson.
@@ -66,19 +95,9 @@ Feedback from test execution:
 Write a SHORT (2-3 sentences) lesson about what went wrong and what to watch out for in similar problems. Focus on the TYPE of mistake (off-by-one, wrong data structure, missed edge case, etc.), not the specific solution. Start with "Lesson:" """
 
 
-def _summarize_problem_for_rag(problem_text: str, max_chars: int = 260) -> str:
-    """Create a compact one-line summary for retrieval matching."""
-    text = " ".join((problem_text or "").strip().split())
-    if not text:
-        return "No problem summary available."
-    if len(text) > max_chars:
-        return text[: max_chars - 3] + "..."
-    return text
-
-
 def _extract_rag_lesson(agent_model, problem_summary: str, score: float,
                         accuracy: float, feedback: str) -> str:
-    """Use the model to generate a concise, reusable lesson."""
+    """Use the model to generate a concise lesson from a mistake."""
     prompt = RAG_LESSON_PROMPT.format(
         problem_summary=problem_summary,
         score=score,
@@ -102,31 +121,19 @@ def _extract_rag_lesson(agent_model, problem_summary: str, score: float,
         return f"Lesson: Scored {score:.2f}. Main issue from feedback: {(feedback or '')[:250]}"
 
 
+def _summarize_problem_for_rag(problem_text: str, max_chars: int = 260) -> str:
+    """Create a compact one-line summary for retrieval matching."""
+    text = " ".join((problem_text or "").strip().split())
+    if not text:
+        return "No problem summary available."
+    if len(text) > max_chars:
+        return text[: max_chars - 3] + "..."
+    return text
+
+
 def _build_rag_chunk(problem_summary: str, lesson: str) -> str:
     """Store both problem summary and lesson for better retrieval."""
     return f"Problem summary: {problem_summary}\n{lesson}"
-
-
-@dataclass
-class AgentConfig7Bv2:
-    """7B v2 config — 16 sequential attempts."""
-    model_name: str = "Qwen/Qwen2.5-7B-Instruct"
-    lr: float = 2e-6
-    ema_rate: float = 0.005
-    num_rollouts: int = 2
-    max_sequential_attempts: int = 16
-    temperature: float = 0.7
-    max_new_tokens: int = 1536
-    rag_top_k: int = 3
-    embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    max_grad_norm: float = 1.0
-    dataset_split: str = "train"
-    max_problems: int = None
-    sdpo_batch_size: int = 1  # smaller with 16 attempts to manage time/memory
-    max_reprompt_tokens: int = 3072
-    checkpoint_every: int = 50
-    feedback_truncate: int = 300
-    feedback_window: int = 6
 
 
 def build_system_prompt_with_rag(rag_db: RAGDatabase, problem_description: str,
@@ -151,11 +158,11 @@ def build_system_prompt_with_rag(rag_db: RAGDatabase, problem_description: str,
     return prompt, retrieved_ids
 
 
-def run_training_loop_7b_v2(config: AgentConfig7Bv2,
+def run_training_loop_7b_v3(config: AgentConfig7Bv3,
                              sdpo_config: SelfDistillationConfig = None,
                              checkpoint_callback=None):
     logger.info("=" * 80)
-    logger.info("  7B SDPO v2 TRAINING (16 attempts, full decision logging)")
+    logger.info("  7B SDPO v3 TRAINING (32 attempts, sliding window, lesson RAG)")
     logger.info("=" * 80)
     logger.info(f"Config: {config}")
 
@@ -169,7 +176,6 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
         f"{torch.cuda.memory_reserved()/1e9:.1f}GB reserved"
     ) if torch.cuda.is_available() else None
 
-    # Load model
     agent_model = AgentModel7B(
         model_name=config.model_name,
         lr=config.lr,
@@ -177,17 +183,14 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
     )
     _log_mem("model_loaded")
 
-    # Load dataset
     logger.info("Loading LiveCodeBench dataset...")
     dataset = load_livecodebench(config.dataset_split)
     logger.info(f"Dataset loaded: {len(dataset)} problems")
 
-    # Initialize RAG
     rag_db = RAGDatabase(config.embedding_model)
 
-    # Tracking
     all_metrics = []
-    decision_log = []  # Full decision log for later analysis
+    decision_log = []
     action_counts = {"sdpo": 0, "rag": 0, "pass": 0}
     sdpo_update_count = 0
     total_accuracy = 0.0
@@ -211,7 +214,6 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
 
         logger.info(f"  Problem: {description[:200]}...")
 
-        # -- Test cases preview --
         try:
             tc = json.loads(tests_json)
             num_tests = len(tc.get("inputs", []))
@@ -223,12 +225,11 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
         except (json.JSONDecodeError, AttributeError, TypeError):
             pass
 
-        # ---- Generate greedy ----
         rag_system, retrieved_ids = build_system_prompt_with_rag(
             rag_db, description or problem[:500], config.rag_top_k
         )
         if retrieved_ids:
-            logger.info(f"  RAG context: chunk IDs {retrieved_ids}")
+            logger.info(f"  RAG lessons: chunk IDs {retrieved_ids}")
         code_prompt = build_code_prompt(problem, tests_json)
 
         responses, _, _ = agent_model.generate(
@@ -249,7 +250,6 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
             logger.info(f"  ║  ... ({len(response)} chars total)")
         logger.info(f"  ╚══════════════════════════════════════════════════════════════╝")
 
-        # ---- Verify ----
         result = verify_solution(response, tests_json)
         score = float(result["score"])
         accuracy = float(result["acc"])
@@ -268,7 +268,6 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
             logger.info(f"  │  All tests passed!")
         logger.info(f"  └─────────────────────────────────────────────────────────────┘")
 
-        # ---- Route ----
         action, payload = llm_route_decision(
             agent_model=agent_model,
             problem=description or problem[:500],
@@ -283,7 +282,6 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
 
         n = idx + 1
 
-        # ---- Decision log entry ----
         decision_entry = {
             "step": n,
             "problem_idx": idx,
@@ -291,13 +289,12 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
             "initial_greedy_score": score,
             "initial_greedy_accuracy": accuracy,
             "initial_feedback": (feedback or "")[:500],
-            "initial_response_snippet": response[:500],
             "action": action,
             "rag_retrieved_ids": retrieved_ids,
             "rag_db_size": rag_db.size,
             "timestamp": time.time(),
-            "sdpo_rollout_details": None,  # filled if sdpo
-            "rag_payload": None,  # filled if rag
+            "sdpo_rollout_details": None,
+            "rag_lesson": None,
         }
 
         step_metrics = {
@@ -326,11 +323,11 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
             if len(sdpo_batch) >= config.sdpo_batch_size:
                 logger.info(f"\n{'~'*80}")
                 logger.info(f"  SDPO BATCH UPDATE #{sdpo_update_count+1}  "
-                            f"({len(sdpo_batch)} problems, 16 attempts x {config.num_rollouts} rollouts)")
+                            f"({len(sdpo_batch)} problems, 32 attempts x {config.num_rollouts} rollouts)")
                 logger.info(f"{'~'*80}")
 
                 _log_mem("before_sdpo")
-                sdpo_metrics = sdpo_batch_step_7b_v2(
+                sdpo_metrics = sdpo_batch_step_7b_v3(
                     agent_model=agent_model,
                     batch_items=sdpo_batch,
                     verify_fn=verify_solution,
@@ -341,7 +338,6 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
 
                 step_metrics["sdpo_batch"] = sdpo_metrics
 
-                # Extract rollout details for decision log
                 if sdpo_metrics.get("rollout_log"):
                     decision_entry["sdpo_rollout_details"] = sdpo_metrics["rollout_log"]
 
@@ -363,10 +359,11 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
             rag_chunk = _build_rag_chunk(problem_summary, lesson)
             chunk_id = rag_db.add(rag_chunk)
             step_metrics["rag_added_id"] = chunk_id
-            step_metrics["rag_chunk"] = rag_chunk
+            decision_entry["rag_lesson"] = lesson
             decision_entry["rag_payload"] = rag_chunk[:500]
-            logger.info(f"  <rag> stored chunk id={chunk_id}, db_size={rag_db.size}")
-            logger.info(f"  <rag> {rag_chunk[:220]}")
+            logger.info(f"  <rag> stored lesson id={chunk_id}, db_size={rag_db.size}")
+            logger.info(f"  <rag> chunk: {rag_chunk[:220]}")
+            step_metrics["rag_chunk"] = rag_chunk
         else:
             logger.info(f"  <pass> correct, no action")
 
@@ -381,12 +378,13 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
                      f"Solve={total_correct}/{n} ({total_correct/n:.3f})  "
                      f"Time={elapsed:.1f}s  │")
         logger.info(f"  │  Actions: {action_counts}  SDPO updates: {sdpo_update_count}  │")
+        logger.info(f"  │  RAG lessons stored: {rag_db.size}                            │")
         logger.info(f"  └─────────────────────────────────────────────────────────────┘")
 
         if n % 10 == 0 or n == num_problems:
-            with open("training_metrics_v2.json", "w") as f:
+            with open("training_metrics_v3.json", "w") as f:
                 json.dump(all_metrics, f, indent=2, cls=_SafeEncoder)
-            with open("training_decisions_v2.json", "w") as f:
+            with open("training_decisions_v3.json", "w") as f:
                 json.dump(decision_log, f, indent=2, default=str)
 
         if n % config.checkpoint_every == 0 or n == num_problems:
@@ -400,14 +398,13 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
             rag_map_path = f"checkpoints/{ckpt_name}_rag_id_map.json"
             with open(rag_map_path, "w") as f:
                 json.dump({str(k): v for k, v in rag_db.id_to_text.items()}, f, indent=2)
-            logger.info(f"Checkpoint saved: {ckpt_path} (RAG: {rag_db.size} chunks)")
+            logger.info(f"Checkpoint saved: {ckpt_path} (RAG: {rag_db.size} lessons)")
             if checkpoint_callback:
                 checkpoint_callback(ckpt_path, rag_path, n, all_metrics, decision_log)
 
-    # Flush remaining
     if sdpo_batch:
         logger.info(f"\n--- FINAL SDPO BATCH ({len(sdpo_batch)} problems) ---")
-        sdpo_metrics = sdpo_batch_step_7b_v2(
+        sdpo_metrics = sdpo_batch_step_7b_v3(
             agent_model=agent_model, batch_items=sdpo_batch,
             verify_fn=verify_solution, config=config, sdpo_config=sdpo_config,
         )
@@ -417,19 +414,18 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
     os.makedirs(final_path, exist_ok=True)
     agent_model.save_checkpoint(final_path)
 
-    # Save final decision log
-    with open("training_decisions_v2.json", "w") as f:
+    with open("training_decisions_v3.json", "w") as f:
         json.dump(decision_log, f, indent=2, default=str)
-    with open("training_metrics_v2.json", "w") as f:
+    with open("training_metrics_v3.json", "w") as f:
         json.dump(all_metrics, f, indent=2, cls=_SafeEncoder)
 
     num = max(num_problems, 1)
     logger.info("\n" + "=" * 80)
-    logger.info("  7B v2 TRAINING COMPLETE")
+    logger.info("  7B v3 TRAINING COMPLETE")
     logger.info(f"  Problems: {num_problems}  Acc: {total_accuracy/num:.3f}  "
                 f"Solve: {total_correct}/{num_problems}")
     logger.info(f"  Actions: {action_counts}  SDPO updates: {sdpo_update_count}")
-    logger.info(f"  RAG: {rag_db.size} chunks")
+    logger.info(f"  RAG lessons: {rag_db.size}")
     logger.info(f"  Decision log: {len(decision_log)} entries")
     logger.info("=" * 80)
 
@@ -437,5 +433,5 @@ def run_training_loop_7b_v2(config: AgentConfig7Bv2,
 
 
 if __name__ == "__main__":
-    config = AgentConfig7Bv2()
-    run_training_loop_7b_v2(config)
+    config = AgentConfig7Bv3()
+    run_training_loop_7b_v3(config)

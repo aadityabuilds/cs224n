@@ -6,6 +6,11 @@ Key differences from sdpo_update.py:
 - Aggressive memory cleanup between rollouts and forward passes
 - Lower top-k (50 instead of 100) to reduce memory during distillation
 """
+# This file uses code from the SDPO (Self-Distillation with Policy Optimization) framework.
+# SDPO is licensed under the Apache License, Version 2.0.
+# Copyright 2025 Hübotter, Lübeck, Behric, Baumann, Bagatella, Marta, Hakimi, Shenfeld, Kleine Buening, Guestrin, Krause
+# Source: https://github.com/lasgroup/SDPO
+# License: http://www.apache.org/licenses/LICENSE-2.0
 import gc
 import logging
 import math
