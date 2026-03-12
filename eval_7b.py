@@ -49,13 +49,13 @@ def evaluate_model(agent_model, dataset, label, max_problems=50,
         if rag_db and rag_db.size > 0:
             chunks = rag_db.query(description or problem[:500], top_k=rag_top_k)
             if chunks:
-                rag_context = "\n\n".join(f"[Knowledge {i+1}]: {c}" for i, c in enumerate(chunks))
+                rag_context = "\n\n".join(f"[Lesson {i+1}]: {c}" for i, c in enumerate(chunks))
                 system_prompt = (
-                    "You are a coding expert. Below are some knowledge snippets retrieved "
-                    "from past problem-solving sessions. They may or may not be relevant to "
-                    "the current problem — only use them if they directly apply.\n\n"
+                    "You are a coding expert. Below are lessons learned from past mistakes "
+                    "on similar problems. Use them to avoid repeating the same errors.\n\n"
                     f"{rag_context}\n\n"
-                    "If none of the above is relevant, ignore it and solve the problem from scratch."
+                    "If none of the above lessons apply to the current problem, ignore them "
+                    "and solve the problem from scratch."
                 )
 
         code_prompt = build_code_prompt(problem, tests_json)
@@ -109,7 +109,7 @@ def evaluate_model(agent_model, dataset, label, max_problems=50,
 def run_eval_7b(trained_model_path="checkpoints/final_model",
                 rag_db_path="checkpoints/rag_db.json",
                 base_model_name="Qwen/Qwen2.5-7B-Instruct",
-                max_problems=50, skip_base=False):
+                max_problems=50, skip_base=False, only_base=False):
     import torch
 
     logger.info("Loading test dataset...")
@@ -118,42 +118,52 @@ def run_eval_7b(trained_model_path="checkpoints/final_model",
 
     all_eval_results = {}
 
-    # Load RAG
-    rag_db = None
-    if os.path.exists(rag_db_path):
-        logger.info(f"Loading RAG from {rag_db_path}...")
-        rag_db = RAGDatabase()
-        with open(rag_db_path) as f:
-            for chunk in json.load(f):
-                rag_db.add(chunk)
-        logger.info(f"RAG: {rag_db.size} chunks")
-
-    # 1. Trained model + RAG (most important — run first)
-    logger.info(f"\n=== Eval 1: TRAINED + RAG ===")
-    trained = AgentModel7B(model_name=trained_model_path, lr=1e-6, ema_rate=0.005)
-    full_metrics = evaluate_model(trained, test_dataset, "model+rag+sdpo",
-                                  max_problems=max_problems, rag_db=rag_db)
-    all_eval_results["model+rag+sdpo"] = full_metrics
-
-    # 2. Trained model without RAG
-    logger.info(f"\n=== Eval 2: TRAINED (no RAG) ===")
-    sdpo_metrics = evaluate_model(trained, test_dataset, "model+sdpo",
-                                  max_problems=max_problems, rag_db=None)
-    all_eval_results["model+sdpo"] = sdpo_metrics
-
-    # Free trained model before loading base
-    del trained
-    torch.cuda.empty_cache()
-
-    # 3. Base model
-    if not skip_base:
-        logger.info(f"\n=== Eval 3: BASE 7B ===")
+    if only_base:
+        # Baseline-only eval — no checkpoint needed
+        logger.info(f"\n=== BASE ONLY EVAL ===")
         base = AgentModel7B(model_name=base_model_name, lr=1e-6, ema_rate=0.005)
         base_metrics = evaluate_model(base, test_dataset, "base_qwen7b",
                                       max_problems=max_problems, rag_db=None)
         all_eval_results["base_qwen7b"] = base_metrics
         del base
         torch.cuda.empty_cache()
+    else:
+        # Load RAG
+        rag_db = None
+        if os.path.exists(rag_db_path):
+            logger.info(f"Loading RAG from {rag_db_path}...")
+            rag_db = RAGDatabase()
+            with open(rag_db_path) as f:
+                for chunk in json.load(f):
+                    rag_db.add(chunk)
+            logger.info(f"RAG: {rag_db.size} chunks")
+
+        # 1. Trained model + RAG (most important — run first)
+        logger.info(f"\n=== Eval 1: TRAINED + RAG ===")
+        trained = AgentModel7B(model_name=trained_model_path, lr=1e-6, ema_rate=0.005)
+        full_metrics = evaluate_model(trained, test_dataset, "model+rag+sdpo",
+                                      max_problems=max_problems, rag_db=rag_db)
+        all_eval_results["model+rag+sdpo"] = full_metrics
+
+        # 2. Trained model without RAG
+        logger.info(f"\n=== Eval 2: TRAINED (no RAG) ===")
+        sdpo_metrics = evaluate_model(trained, test_dataset, "model+sdpo",
+                                      max_problems=max_problems, rag_db=None)
+        all_eval_results["model+sdpo"] = sdpo_metrics
+
+        # Free trained model before loading base
+        del trained
+        torch.cuda.empty_cache()
+
+        # 3. Base model
+        if not skip_base:
+            logger.info(f"\n=== Eval 3: BASE 7B ===")
+            base = AgentModel7B(model_name=base_model_name, lr=1e-6, ema_rate=0.005)
+            base_metrics = evaluate_model(base, test_dataset, "base_qwen7b",
+                                          max_problems=max_problems, rag_db=None)
+            all_eval_results["base_qwen7b"] = base_metrics
+            del base
+            torch.cuda.empty_cache()
 
     # Print comparison
     logger.info("\n" + "=" * 80)

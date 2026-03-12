@@ -27,10 +27,11 @@ logger = logging.getLogger(__name__)
 
 SEQUENTIAL_FEEDBACK_TEMPLATE = """{prompt}
 
-Previous attempt feedback:
+IMPORTANT: Your previous solutions for this problem were INCORRECT. Below are the errors from your most recent attempts:
+
 {feedback_history}
 
-Use the above feedback to avoid the same mistakes. Correctly solve the problem."""
+You MUST write a completely new and correct solution. Carefully analyze each error above — understand WHY the previous approach failed, then choose a DIFFERENT algorithm or fix the root cause. Do NOT repeat the same logic that already failed. Output only the corrected Python solution."""
 
 
 def _sequential_rollout(agent_model, prompt, system_prompt, tests_json,
@@ -70,7 +71,7 @@ def _sequential_rollout(agent_model, prompt, system_prompt, tests_json,
         resp_ids = resp_ids_list[0]
 
         result = verify_fn(decoded, tests_json)
-        score = result["score"]
+        score = float(result["score"])
         feedback = result.get("feedback", "")
 
         # Log attempt details
@@ -498,12 +499,12 @@ def sdpo_batch_step(agent_model, batch_items: list[dict], verify_fn,
         logger.info(f"    └{'─'*60}┘")
 
         total_loss += problem_loss
-        all_scores = [r["score"] for r in pdata["rollout_results"]]
+        all_scores = [float(r["score"]) for r in pdata["rollout_results"]]
         per_problem_metrics.append({
             "problem_idx": prob_idx,
-            "baseline": baseline,
+            "baseline": float(baseline),
             "rollout_scores": all_scores,
-            "demo_score": pdata["rollout_results"][pdata["demo_idx"]]["score"],
+            "demo_score": float(pdata["rollout_results"][pdata["demo_idx"]]["score"]),
             "rollouts_distilled": problem_rollouts,
             "problem_loss": problem_loss,
         })

@@ -1,17 +1,14 @@
-"""Modal app: Qwen2.5-7B-Instruct SDPO training on A100-80GB.
+"""Modal app: Qwen2.5-7B-Instruct SDPO v3 — 32 attempts, sliding feedback, lesson RAG.
 
-Memory-optimized for 7B:
-- NO reference model (saves ~14GB) — student + teacher only
-- Gradient checkpointing on student
-- Aggressive torch.cuda.empty_cache() between rollouts
-- Smaller batch size (2 problems per SDPO step)
-- 2 rollouts x 4 sequential attempts (instead of 4x4)
-- max_new_tokens=1536 (instead of 2048)
-- Update condition: 100% accuracy only (score >= 0.999)
+Key v3 differences:
+- 32 sequential attempts per rollout (up from 16 in v2)
+- Sliding feedback window (last 6 attempts) to keep prompts bounded
+- RAG stores lessons/mistakes, not raw failed solutions
+- sdpo_batch_size=1
 """
 import modal
 
-app = modal.App("cs224n-7b-sdpo")
+app = modal.App("cs224n-7b-sdpo-v3")
 
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -49,7 +46,7 @@ image = (
     ])
 )
 
-volume = modal.Volume.from_name("cs224n-7b-results", create_if_missing=True)
+volume = modal.Volume.from_name("cs224n-7b-v3-results", create_if_missing=True)
 VOLUME_PATH = "/results"
 
 
@@ -82,8 +79,8 @@ def run_training_and_eval(
     lr: float = 2e-6,
     ema_rate: float = 0.005,
     num_rollouts: int = 2,
-    max_sequential_attempts: int = 4,
-    sdpo_batch_size: int = 2,
+    max_sequential_attempts: int = 32,
+    sdpo_batch_size: int = 1,
     temperature: float = 0.7,
     max_problems: int = 647,
     num_eval_problems: int = 50,
@@ -92,7 +89,8 @@ def run_training_and_eval(
     distillation_topk: int = 50,
     max_new_tokens: int = 1536,
     checkpoint_every: int = 50,
-    resume_step: int = 0,
+    feedback_window: int = 6,
+    feedback_truncate: int = 250,
 ):
     import json
     import logging
@@ -102,46 +100,16 @@ def run_training_and_eval(
     torch = _setup_env()
     os.makedirs(f"{VOLUME_PATH}/checkpoints", exist_ok=True)
 
-    # ---- Resume: copy checkpoint from volume BEFORE opening log file ----
-    resume_checkpoint_path = None
-    resume_rag_path = None
-    resume_metrics_path = None
-
-    if resume_step > 0:
-        volume.reload()
-        vol_ckpt = f"{VOLUME_PATH}/checkpoints/step_{resume_step}"
-        local_ckpt = f"checkpoints/resume_model"
-        local_rag = f"checkpoints/resume_rag.json"
-        local_metrics = f"checkpoints/resume_metrics.json"
-
-        if os.path.exists(f"{vol_ckpt}/model"):
-            shutil.copytree(f"{vol_ckpt}/model", local_ckpt, dirs_exist_ok=True)
-            resume_checkpoint_path = local_ckpt
-            print(f"[resume] Copied model checkpoint from {vol_ckpt}/model")
-        else:
-            print(f"[resume] WARNING: No model checkpoint at {vol_ckpt}/model")
-
-        if os.path.exists(f"{vol_ckpt}/rag_db.json"):
-            shutil.copy(f"{vol_ckpt}/rag_db.json", local_rag)
-            resume_rag_path = local_rag
-            print(f"[resume] Copied RAG DB from {vol_ckpt}/rag_db.json")
-
-        if os.path.exists(f"{vol_ckpt}/metrics.json"):
-            shutil.copy(f"{vol_ckpt}/metrics.json", local_metrics)
-            resume_metrics_path = local_metrics
-            print(f"[resume] Copied metrics from {vol_ckpt}/metrics.json")
-
-    # Now safe to open log file on the volume
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(f"{VOLUME_PATH}/training_7b.log"),
+            logging.FileHandler(f"{VOLUME_PATH}/training_7b_v3.log"),
         ],
         force=True,
     )
-    logger = logging.getLogger("modal_7b")
+    logger = logging.getLogger("modal_7b_v3")
 
     logger.info(f"CUDA: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -149,17 +117,14 @@ def run_training_and_eval(
         mem = torch.cuda.get_device_properties(0).total_memory
         logger.info(f"GPU memory: {mem / 1e9:.1f} GB")
 
-    # ---- PHASE 1: Training ----
     logger.info("\n" + "=" * 70)
-    logger.info("PHASE 1: TRAINING (Qwen2.5-7B-Instruct)")
-    if resume_step > 0:
-        logger.info(f"  RESUMING from step {resume_step}")
+    logger.info("PHASE 1: TRAINING v3 (Qwen2.5-7B, 32 attempts, lesson RAG)")
     logger.info("=" * 70)
 
     from agent.config import SelfDistillationConfig
-    from main_7b import AgentConfig7B, run_training_loop_7b
+    from main_7b_v3 import AgentConfig7Bv3, run_training_loop_7b_v3
 
-    config = AgentConfig7B(
+    config = AgentConfig7Bv3(
         model_name="Qwen/Qwen2.5-7B-Instruct",
         max_problems=max_problems,
         num_rollouts=num_rollouts,
@@ -171,6 +136,8 @@ def run_training_and_eval(
         max_new_tokens=max_new_tokens,
         checkpoint_every=checkpoint_every,
         max_reprompt_tokens=3072,
+        feedback_window=feedback_window,
+        feedback_truncate=feedback_truncate,
     )
 
     sdpo_config = SelfDistillationConfig(
@@ -182,11 +149,7 @@ def run_training_and_eval(
     logger.info(f"Config: {config}")
     logger.info(f"SDPO config: {sdpo_config}")
 
-    logger.info(f"GPU memory before model load: "
-                f"{torch.cuda.memory_allocated()/1e9:.1f}GB allocated, "
-                f"{torch.cuda.memory_reserved()/1e9:.1f}GB reserved")
-
-    def checkpoint_callback(ckpt_path, rag_path, step, metrics):
+    def checkpoint_callback(ckpt_path, rag_path, step, metrics, decision_log=None):
         dst = f"{VOLUME_PATH}/checkpoints/step_{step}"
         os.makedirs(dst, exist_ok=True)
         if os.path.isdir(ckpt_path):
@@ -198,23 +161,23 @@ def run_training_and_eval(
             shutil.copy(rag_map_path, f"{dst}/rag_id_map.json")
         with open(f"{dst}/metrics.json", "w") as f:
             json.dump(metrics, f, indent=2)
+        if decision_log:
+            with open(f"{dst}/decisions.json", "w") as f:
+                json.dump(decision_log, f, indent=2, default=str)
         volume.commit()
         logger.info(f"Checkpoint persisted: {dst}")
 
-    all_metrics, agent_model, rag_db = run_training_loop_7b(
-        config, sdpo_config=sdpo_config, checkpoint_callback=checkpoint_callback,
-        resume_from_step=resume_step,
-        resume_checkpoint_path=resume_checkpoint_path,
-        resume_rag_path=resume_rag_path,
-        resume_metrics_path=resume_metrics_path,
+    all_metrics, agent_model, rag_db, decision_log = run_training_loop_7b_v3(
+        config, sdpo_config=sdpo_config, checkpoint_callback=checkpoint_callback
     )
 
     rag_db_path = "checkpoints/rag_db.json"
     with open(rag_db_path, "w") as f:
         json.dump(rag_db.texts, f, indent=2)
 
-    if os.path.exists("training_metrics.json"):
-        shutil.copy("training_metrics.json", f"{VOLUME_PATH}/training_metrics.json")
+    for fname in ["training_metrics_v3.json", "training_decisions_v3.json"]:
+        if os.path.exists(fname):
+            shutil.copy(fname, f"{VOLUME_PATH}/{fname}")
     shutil.copy(rag_db_path, f"{VOLUME_PATH}/rag_db.json")
     volume.commit()
 
@@ -223,7 +186,7 @@ def run_training_and_eval(
 
     # ---- PHASE 2: Evaluation ----
     logger.info("\n" + "=" * 70)
-    logger.info("PHASE 2: EVALUATION (7B)")
+    logger.info("PHASE 2: EVALUATION (7B v3)")
     logger.info("=" * 70)
 
     from eval_7b import run_eval_7b
@@ -237,10 +200,11 @@ def run_training_and_eval(
         rag_db_path=rag_db_path,
         base_model_name="Qwen/Qwen2.5-7B-Instruct",
         max_problems=num_eval_problems,
+        skip_base=False,
     )
 
-    if os.path.exists("eval_results_7b.json"):
-        shutil.copy("eval_results_7b.json", f"{VOLUME_PATH}/eval_results_7b.json")
+    with open(f"{VOLUME_PATH}/eval_7b_v3.json", "w") as f:
+        json.dump(eval_results, f, indent=2, default=str)
     volume.commit()
 
     _print_results(logger, eval_results)
@@ -250,7 +214,7 @@ def run_training_and_eval(
 @app.function(
     image=image,
     gpu="H100",
-    timeout=3600 * 4,
+    timeout=3600 * 6,
     volumes={VOLUME_PATH: volume},
     memory=32768,
 )
@@ -259,9 +223,9 @@ def run_eval_only(checkpoint_step: int = 50, num_eval_problems: int = 50,
     import json
     import logging
     import os
-    import shutil
 
     torch = _setup_env()
+    volume.reload()
 
     logging.basicConfig(
         level=logging.INFO,
@@ -269,34 +233,31 @@ def run_eval_only(checkpoint_step: int = 50, num_eval_problems: int = 50,
         handlers=[logging.StreamHandler()],
         force=True,
     )
-    logger = logging.getLogger("modal_eval_7b")
-    volume.reload()
+    logger = logging.getLogger("modal_eval_7b_v3")
 
-    vol_model = f"{VOLUME_PATH}/checkpoints/step_{checkpoint_step}/model"
-    vol_rag = f"{VOLUME_PATH}/checkpoints/step_{checkpoint_step}/rag_db.json"
-    local_model = "checkpoints/eval_model"
-    local_rag = "checkpoints/eval_rag.json"
+    step = checkpoint_step or 50
+    vol_model = f"{VOLUME_PATH}/checkpoints/step_{step}/model"
+    vol_rag = f"{VOLUME_PATH}/checkpoints/step_{step}/rag_db.json"
 
-    if not only_base:
-        if os.path.exists(vol_model):
-            shutil.copytree(vol_model, local_model, dirs_exist_ok=True)
-        else:
-            logger.error(f"Model not found: {vol_model}")
-            return {"error": f"Model not found at {vol_model}"}
-        if os.path.exists(vol_rag):
-            shutil.copy(vol_rag, local_rag)
+    if not only_base and not os.path.exists(vol_model):
+        logger.error(f"Checkpoint not found: {vol_model}")
+        return {"error": f"No checkpoint at step {step}"}
 
     from eval_7b import run_eval_7b
+
+    model_path = vol_model if not only_base else "unused"
+    rag_path = (vol_rag if os.path.exists(vol_rag) else "nonexistent") if not only_base else "nonexistent"
     eval_results = run_eval_7b(
-        trained_model_path=local_model if not only_base else "unused",
-        rag_db_path=local_rag if not only_base else "nonexistent",
+        trained_model_path=model_path,
+        rag_db_path=rag_path,
         base_model_name="Qwen/Qwen2.5-7B-Instruct",
         max_problems=num_eval_problems,
         skip_base=skip_base,
         only_base=only_base,
     )
 
-    with open(f"{VOLUME_PATH}/eval_7b_step{checkpoint_step}.json", "w") as f:
+    out_name = f"eval_7b_v3_base_only.json" if only_base else f"eval_7b_v3_step{step}.json"
+    with open(f"{VOLUME_PATH}/{out_name}", "w") as f:
         json.dump(eval_results, f, indent=2, default=str)
     volume.commit()
 
@@ -306,7 +267,7 @@ def run_eval_only(checkpoint_step: int = 50, num_eval_problems: int = 50,
 
 def _print_results(logger, eval_results):
     logger.info("\n" + "#" * 80)
-    logger.info("# 7B RESULTS")
+    logger.info("# 7B v3 RESULTS")
     logger.info("#" * 80)
     logger.info(f"  {'Config':<25} {'Test-Case Acc':>14} {'Solve Rate':>12} {'Correct':>10}")
     logger.info("-" * 80)
@@ -329,8 +290,8 @@ def main(
     lr: float = 2e-6,
     ema_rate: float = 0.005,
     num_rollouts: int = 2,
-    max_sequential_attempts: int = 4,
-    sdpo_batch_size: int = 2,
+    max_sequential_attempts: int = 32,
+    sdpo_batch_size: int = 1,
     temperature: float = 0.7,
     max_problems: int = 647,
     ref_kl_beta: float = 0.0,
@@ -338,18 +299,18 @@ def main(
     distillation_topk: int = 50,
     max_new_tokens: int = 1536,
     checkpoint_every: int = 50,
-    resume_step: int = 0,
+    feedback_window: int = 6,
+    feedback_truncate: int = 250,
 ):
-    """7B SDPO training + eval.
+    """7B SDPO v3 training + eval.
 
     Usage:
-      modal run modal_app_7b.py
-      modal run modal_app_7b.py --lr 1e-6 --ref-kl-beta 0.05
-      modal run modal_app_7b.py --eval-only --checkpoint-step 100
-      modal run modal_app_7b.py --resume-step 250
+      modal run modal_app_7b_v3.py
+      modal run modal_app_7b_v3.py --eval-only --checkpoint-step 100
+      modal run --detach modal_app_7b_v3.py --max-problems 200
     """
     if eval_only:
-        print(f"Launching 7B EVAL-ONLY on A100-80GB...")
+        print(f"Launching 7B v3 EVAL-ONLY on H100...")
         print(f"  checkpoint_step={checkpoint_step}, num_eval_problems={num_eval_problems}, only_base={only_base}")
         result = run_eval_only.remote(
             checkpoint_step=checkpoint_step,
@@ -358,16 +319,16 @@ def main(
             only_base=only_base,
         )
     else:
-        print("Launching 7B TRAINING + EVAL on A100-80GB...")
+        print("Launching 7B v3 TRAINING + EVAL on H100...")
         print(f"  model=Qwen2.5-7B-Instruct")
         print(f"  lr={lr}, ema_rate={ema_rate}, temperature={temperature}")
-        print(f"  num_rollouts={num_rollouts}x{max_sequential_attempts}, "
+        print(f"  num_rollouts={num_rollouts}x{max_sequential_attempts} attempts, "
               f"sdpo_batch_size={sdpo_batch_size}")
+        print(f"  feedback_window={feedback_window}, feedback_truncate={feedback_truncate}")
         print(f"  ref_kl_beta={ref_kl_beta}, alpha={alpha}, topk={distillation_topk}")
         print(f"  max_new_tokens={max_new_tokens}, max_problems={max_problems}")
         print(f"  UPDATE CONDITION: 100% accuracy only")
-        if resume_step > 0:
-            print(f"  RESUMING from step {resume_step}")
+        print(f"  RAG: lesson-based (stores mistakes, not solutions)")
         print()
         result = run_training_and_eval.remote(
             lr=lr, ema_rate=ema_rate,
@@ -382,11 +343,12 @@ def main(
             distillation_topk=distillation_topk,
             max_new_tokens=max_new_tokens,
             checkpoint_every=checkpoint_every,
-            resume_step=resume_step,
+            feedback_window=feedback_window,
+            feedback_truncate=feedback_truncate,
         )
 
     print("\n" + "=" * 80)
-    print("7B FINAL RESULTS")
+    print("7B v3 FINAL RESULTS")
     print("=" * 80)
     print(f"  {'Config':<25} {'Test-Case Acc':>14} {'Solve Rate':>12} {'Correct':>10}")
     print("-" * 80)

@@ -1,15 +1,15 @@
-"""7B SDPO batch update — 100% accuracy condition, memory-optimized.
+"""7B SDPO v3 batch update — 32 sequential attempts, sliding feedback window.
 
-Key differences from sdpo_update.py:
-- Update condition: rollout must score >= 0.999 (100% accuracy on all tests)
-- No reference KL anchor (no reference model loaded to save memory)
-- Aggressive memory cleanup between rollouts and forward passes
-- Lower top-k (50 instead of 100) to reduce memory during distillation
+Key differences from v2:
+- 32 max attempts (up from 16)
+- Sliding feedback window (last N feedbacks, not all) to keep prompts short
+- Same 100% accuracy condition
 """
 import gc
 import logging
 import math
 import re
+import time
 import torch
 import torch.nn.functional as F
 
@@ -17,11 +17,10 @@ from agent.config import SelfDistillationConfig
 
 logger = logging.getLogger(__name__)
 
-PERFECT_SCORE = 0.999  # Threshold for "100% accuracy"
-
+PERFECT_SCORE = 0.999
 
 # ------------------------------------------------------------------
-# Sequential rollout with cumulative feedback
+# Sequential rollout with SLIDING WINDOW feedback
 # ------------------------------------------------------------------
 
 SEQUENTIAL_FEEDBACK_TEMPLATE = """{prompt}
@@ -34,24 +33,35 @@ You MUST write a completely new and correct solution. Carefully analyze each err
 
 
 def _sequential_rollout(agent_model, prompt, system_prompt, tests_json,
-                        verify_fn, max_attempts=4,
+                        verify_fn, max_attempts=32,
                         temperature=0.7, max_new_tokens=1536,
-                        rollout_idx=0):
-    """Generate one rollout aiming for 100% accuracy.
+                        rollout_idx=0, feedback_truncate=250,
+                        feedback_window=6):
+    """Generate one rollout with up to 32 sequential attempts.
 
-    Returns the best attempt. Early stops if any attempt scores >= PERFECT_SCORE.
+    Uses a sliding window of the last `feedback_window` feedbacks
+    to keep prompt length bounded regardless of attempt count.
     """
     best = None
-    feedback_history = []
+    all_feedback = []  # store all, but only use last feedback_window
+    attempt_log = []
 
     logger.info(f"      ┌── Rollout {rollout_idx} ──────────────────────────────────────┐")
-    logger.info(f"      │  Target: 100% accuracy (>={PERFECT_SCORE})                    │")
+    logger.info(f"      │  Target: 100% accuracy, up to {max_attempts} attempts          │")
+    logger.info(f"      │  Feedback window: last {feedback_window} attempts               │")
     logger.info(f"      └───────────────────────────────────────────────────────────────┘")
 
     for attempt in range(max_attempts):
-        if feedback_history:
+        attempt_start = time.time()
+
+        if all_feedback:
+            # Sliding window: only include the last N feedbacks
+            recent = all_feedback[-feedback_window:]
+            # Number them relative to their actual attempt index
+            start_idx = len(all_feedback) - len(recent)
             history_str = "\n".join(
-                f"Attempt {i+1}: {fb}" for i, fb in enumerate(feedback_history)
+                f"Attempt {start_idx + i + 1}: {fb}"
+                for i, fb in enumerate(recent)
             )
             attempt_prompt = SEQUENTIAL_FEEDBACK_TEMPLATE.format(
                 prompt=prompt, feedback_history=history_str,
@@ -71,25 +81,44 @@ def _sequential_rollout(agent_model, prompt, system_prompt, tests_json,
         score = float(result["score"])
         feedback = result.get("feedback", "")
         is_perfect = score >= PERFECT_SCORE
+        attempt_elapsed = time.time() - attempt_start
 
-        logger.info(f"      ╔══ Attempt {attempt+1}/{max_attempts} (rollout {rollout_idx}) ══╗")
-        logger.info(f"      ║  Score: {score:.3f}  "
-                     f"{'★★★ PERFECT' if is_perfect else 'not perfect'}")
+        attempt_entry = {
+            "attempt": attempt + 1,
+            "score": score,
+            "accuracy": float(result.get("acc", 0)),
+            "is_perfect": bool(is_perfect),
+            "feedback_snippet": (feedback or "passed")[:300],
+            "response_snippet": decoded[:400],
+            "prompt_tokens": len(prompt_ids),
+            "response_tokens": len(resp_ids),
+            "elapsed_seconds": attempt_elapsed,
+            "feedback_window_used": min(len(all_feedback), feedback_window),
+        }
+        attempt_log.append(attempt_entry)
 
-        logger.info(f"      ╠══ MODEL OUTPUT ════════════════════════════════════════╣")
-        for line in decoded[:1500].split('\n'):
-            logger.info(f"      ║  {line}")
-        if len(decoded) > 1500:
-            logger.info(f"      ║  ... ({len(decoded)} chars)")
-
-        logger.info(f"      ╠══ VERIFIER ═════════════════════════════════════════════╣")
-        logger.info(f"      ║  Score: {score:.3f}  Acc: {result.get('acc', 0):.3f}")
-        if feedback:
-            for line in feedback[:400].split('\n'):
-                logger.info(f"      ║    {line}")
+        # Log every 8th attempt, perfect ones, first, and last
+        if attempt % 8 == 0 or is_perfect or attempt == max_attempts - 1:
+            logger.info(f"      ╔══ Attempt {attempt+1}/{max_attempts} (rollout {rollout_idx}) ══╗")
+            logger.info(f"      ║  Score: {score:.3f}  "
+                         f"{'PERFECT' if is_perfect else 'not perfect'}  "
+                         f"({attempt_elapsed:.1f}s)  "
+                         f"fb_window={min(len(all_feedback), feedback_window)}")
+            logger.info(f"      ╠══ MODEL OUTPUT ════════════════════════════════════════╣")
+            for line in decoded[:800].split('\n'):
+                logger.info(f"      ║  {line}")
+            if len(decoded) > 800:
+                logger.info(f"      ║  ... ({len(decoded)} chars)")
+            logger.info(f"      ╠══ VERIFIER ═════════════════════════════════════════════╣")
+            logger.info(f"      ║  Score: {score:.3f}  Acc: {result.get('acc', 0):.3f}")
+            if feedback:
+                for line in feedback[:250].split('\n'):
+                    logger.info(f"      ║    {line}")
+            else:
+                logger.info(f"      ║    All tests passed!")
+            logger.info(f"      ╚══════════════════════════════════════════════════════════╝")
         else:
-            logger.info(f"      ║    All tests passed!")
-        logger.info(f"      ╚══════════════════════════════════════════════════════════╝")
+            logger.info(f"      │ Attempt {attempt+1}: score={score:.3f} ({attempt_elapsed:.1f}s)")
 
         if best is None or score > best["score"]:
             best = {
@@ -105,19 +134,18 @@ def _sequential_rollout(agent_model, prompt, system_prompt, tests_json,
             logger.info(f"      >>> PERFECT at attempt {attempt+1} — early stop")
             break
 
-        feedback_history.append(feedback[:500] if feedback else "incorrect")
-        if attempt < max_attempts - 1:
-            logger.info(f"      ... retrying with cumulative feedback")
+        all_feedback.append(
+            feedback[:feedback_truncate] if feedback else "incorrect"
+        )
 
     logger.info(f"      ┌── Rollout {rollout_idx} RESULT ──────────────────────────────┐")
-    logger.info(f"      │  Best: {best['score']:.3f} (attempt {best['attempt']+1})  "
-                 f"Perfect: {'YES ★' if best['score'] >= PERFECT_SCORE else 'NO'}  │")
+    logger.info(f"      │  Best: {best['score']:.3f} (attempt {best['attempt']+1}/{max_attempts})  "
+                 f"Perfect: {'YES' if best['score'] >= PERFECT_SCORE else 'NO'}  "
+                 f"Total attempts: {len(attempt_log)}  │")
     logger.info(f"      └──────────────────────────────────────────────────────────────┘")
 
-    # Memory cleanup after rollout
     torch.cuda.empty_cache()
-
-    return best
+    return best, attempt_log
 
 
 # ------------------------------------------------------------------
@@ -163,7 +191,7 @@ def build_reprompt(original_prompt, demonstration=None, feedback=None, strip_thi
 
 
 # ------------------------------------------------------------------
-# Top-k KL loss (same as sdpo_update.py)
+# Top-k KL loss
 # ------------------------------------------------------------------
 
 def _add_tail_logprob(topk_log_probs):
@@ -207,65 +235,86 @@ def compute_topk_kl_loss(student_topk_lp, teacher_topk_lp, mask,
 
 
 # ------------------------------------------------------------------
-# Main 7B SDPO batch step
+# Main 7B v3 SDPO batch step
 # ------------------------------------------------------------------
 
-def sdpo_batch_step_7b(agent_model, batch_items, verify_fn,
-                        config, sdpo_config=None):
-    """SDPO gradient step for 7B — only 100%-accuracy rollouts used."""
+def sdpo_batch_step_7b_v3(agent_model, batch_items, verify_fn,
+                           config, sdpo_config=None):
+    """SDPO gradient step for 7B v3 — 32 attempts, sliding window feedback."""
     if sdpo_config is None:
         sdpo_config = SelfDistillationConfig(reference_kl_beta=0.0)
 
     G = config.num_rollouts
-    max_attempts = getattr(config, "max_sequential_attempts", 4)
+    max_attempts = getattr(config, "max_sequential_attempts", 32)
     topk = sdpo_config.distillation_topk or 50
+    feedback_truncate = getattr(config, "feedback_truncate", 250)
+    feedback_window = getattr(config, "feedback_window", 6)
 
     logger.info(f"  ╔══════════════════════════════════════════════════════════════════╗")
-    logger.info(f"  ║  7B SDPO BATCH: {len(batch_items)} problems, {G} rollouts x "
+    logger.info(f"  ║  7B v3 SDPO BATCH: {len(batch_items)} problems, {G} rollouts x "
                 f"{max_attempts} attempts   ║")
-    logger.info(f"  ║  CONDITION: only 100% accuracy rollouts (>={PERFECT_SCORE})      ║")
-    logger.info(f"  ║  top-{topk} KL, alpha={sdpo_config.alpha}                       ║")
+    logger.info(f"  ║  Feedback window: last {feedback_window}, truncate={feedback_truncate}  ║")
+    logger.info(f"  ║  CONDITION: only 100% accuracy (>={PERFECT_SCORE})               ║")
     logger.info(f"  ╚══════════════════════════════════════════════════════════════════╝")
 
-    # Phase 1: Sequential rollouts
     all_problem_data = []
+    rollout_log = []
 
     for item_idx, item in enumerate(batch_items):
         prob_idx = item.get("problem_idx", item_idx)
         initial_score = item.get("initial_score", 0.0)
 
         logger.info(f"\n  ┌{'─'*70}┐")
-        logger.info(f"  │  7B PROBLEM {item_idx+1}/{len(batch_items)} "
-                     f"(orig #{prob_idx+1})  initial_score={initial_score:.3f}  │")
+        logger.info(f"  │  v3 PROBLEM {item_idx+1}/{len(batch_items)} "
+                     f"(orig #{prob_idx+1})  initial={initial_score:.3f}  │")
         logger.info(f"  └{'─'*70}┘")
+
+        problem_rollout_log = {
+            "problem_idx": prob_idx,
+            "initial_score": initial_score,
+            "rollouts": [],
+        }
 
         rollout_results = []
         for ri in range(G):
-            result = _sequential_rollout(
+            result, attempt_log = _sequential_rollout(
                 agent_model, item["prompt"], item.get("system_prompt"),
                 item["tests_json"], verify_fn,
                 max_attempts=max_attempts, temperature=config.temperature,
                 max_new_tokens=config.max_new_tokens,
                 rollout_idx=ri,
+                feedback_truncate=feedback_truncate,
+                feedback_window=feedback_window,
             )
             rollout_results.append(result)
+            problem_rollout_log["rollouts"].append({
+                "rollout_idx": ri,
+                "best_score": float(result["score"]),
+                "best_attempt": result["attempt"] + 1,
+                "num_attempts": len(attempt_log),
+                "is_perfect": bool(result["score"] >= PERFECT_SCORE),
+                "attempts": attempt_log,
+            })
 
-        # Summary
         scores = [float(r["score"]) for r in rollout_results]
         num_perfect = sum(1 for s in scores if s >= PERFECT_SCORE)
+        problem_rollout_log["num_perfect"] = num_perfect
+        problem_rollout_log["mean_score"] = float(sum(scores) / len(scores))
+
         logger.info(f"  ┌── ROLLOUT SUMMARY (problem #{prob_idx+1}) ──────────────────────┐")
         for ri, rr in enumerate(rollout_results):
-            star = "★ PERFECT" if rr["score"] >= PERFECT_SCORE else "  partial"
+            star = "PERFECT" if rr["score"] >= PERFECT_SCORE else "partial"
             logger.info(f"  │  Rollout {ri}: score={rr['score']:.3f}  "
                         f"attempt={rr['attempt']+1}/{max_attempts}  {star}  │")
         logger.info(f"  │  Perfect: {num_perfect}/{G}  Mean: {sum(scores)/len(scores):.3f}  │")
         logger.info(f"  └───────────────────────────────────────────────────────────────┘")
 
         if num_perfect == 0:
-            logger.info(f"  ╳ SKIPPED: no rollout achieved 100% accuracy")
+            logger.info(f"  SKIPPED: no rollout achieved 100% accuracy")
+            problem_rollout_log["decision"] = "skipped_no_perfect"
+            rollout_log.append(problem_rollout_log)
             continue
 
-        # Demo = best perfect rollout
         demo_idx = None
         best_score = -1
         for i, r in enumerate(rollout_results):
@@ -273,7 +322,9 @@ def sdpo_batch_step_7b(agent_model, batch_items, verify_fn,
                 demo_idx = i
                 best_score = r["score"]
 
-        logger.info(f"  ✓ Demo: rollout {demo_idx} (score={best_score:.3f})")
+        logger.info(f"  Demo: rollout {demo_idx} (score={best_score:.3f})")
+        problem_rollout_log["demo_rollout_idx"] = demo_idx
+        problem_rollout_log["decision"] = "distill"
 
         fail_feedback = item.get("initial_feedback")
         demo_text = rollout_results[demo_idx]["decoded"]
@@ -305,15 +356,15 @@ def sdpo_batch_step_7b(agent_model, batch_items, verify_fn,
             "student_prompt_ids": student_prompt_ids,
         })
 
-        # Cleanup between problems
+        rollout_log.append(problem_rollout_log)
         torch.cuda.empty_cache()
 
     if not all_problem_data:
-        logger.info(f"  ╳ No problems with 100% rollouts — skipping")
+        logger.info(f"  No problems with 100% rollouts — skipping")
         return {"sdpo_loss": 0.0, "num_problems_updated": 0,
-                "num_rollouts_used": 0, "skipped": True}
+                "num_rollouts_used": 0, "skipped": True, "rollout_log": rollout_log}
 
-    # Phase 2: Distillation — only perfect rollouts
+    # Phase 2: Distillation
     agent_model.optimizer.zero_grad()
     agent_model.student.train()
 
@@ -334,12 +385,10 @@ def sdpo_batch_step_7b(agent_model, batch_items, verify_fn,
 
         for i, rr in enumerate(pdata["rollout_results"]):
             if rr["score"] < PERFECT_SCORE:
-                logger.info(f"    │  Rollout {i}: score={rr['score']:.3f} "
-                            f"< {PERFECT_SCORE} — SKIP")
+                logger.info(f"    │  Rollout {i}: score={rr['score']:.3f} — SKIP")
                 continue
             if i == pdata["demo_idx"]:
-                logger.info(f"    │  Rollout {i}: score={rr['score']:.3f} "
-                            f"— SKIP (is demo)")
+                logger.info(f"    │  Rollout {i}: SKIP (is demo)")
                 continue
 
             response_ids = rr["response_ids"]
@@ -347,13 +396,11 @@ def sdpo_batch_step_7b(agent_model, batch_items, verify_fn,
                 continue
 
             try:
-                # Teacher forward
                 teacher_token_lp, teacher_topk_lp, teacher_topk_idx = \
                     agent_model.forward_teacher_topk(
                         pdata["teacher_prompt_ids"], response_ids, topk=topk
                     )
 
-                # Student forward
                 student_token_lp, student_gathered_lp = \
                     agent_model.forward_student_at_teacher_topk(
                         pdata["student_prompt_ids"], response_ids, teacher_topk_idx
@@ -377,7 +424,7 @@ def sdpo_batch_step_7b(agent_model, batch_items, verify_fn,
                 problem_rollouts += 1
                 total_rollouts_used += 1
 
-                logger.info(f"    │  Rollout {i}: ★ perfect  "
+                logger.info(f"    │  Rollout {i}: perfect  "
                             f"kl_loss={loss_val:.4f}  tokens={len(response_ids)}")
 
             except RuntimeError as e:
@@ -387,7 +434,6 @@ def sdpo_batch_step_7b(agent_model, batch_items, verify_fn,
                     gc.collect()
                     continue
                 raise
-
             finally:
                 torch.cuda.empty_cache()
 
@@ -405,11 +451,10 @@ def sdpo_batch_step_7b(agent_model, batch_items, verify_fn,
         })
 
     if total_rollouts_used == 0:
-        logger.info(f"  ╳ No perfect non-demo rollouts — skipping optimizer step")
+        logger.info(f"  No perfect non-demo rollouts — skipping optimizer step")
         return {"sdpo_loss": 0.0, "num_problems_updated": len(all_problem_data),
-                "num_rollouts_used": 0, "skipped": True}
+                "num_rollouts_used": 0, "skipped": True, "rollout_log": rollout_log}
 
-    # Scale + step
     scale = 1.0 / total_rollouts_used
     for param in agent_model.student.parameters():
         if param.grad is not None:
@@ -431,18 +476,17 @@ def sdpo_batch_step_7b(agent_model, batch_items, verify_fn,
         "num_rollouts_used": total_rollouts_used,
         "per_problem": per_problem_metrics,
         "skipped": False,
+        "rollout_log": rollout_log,
     }
 
     logger.info(f"\n  ╔══════════════════════════════════════════════════════════════════╗")
-    logger.info(f"  ║  7B SDPO STEP COMPLETE                                         ║")
+    logger.info(f"  ║  7B v3 SDPO STEP COMPLETE                                      ║")
     logger.info(f"  ║  Loss: {avg_loss:.4f}  Grad norm: {metrics['grad_norm']:.4f}   ║")
     logger.info(f"  ║  Updated: {metrics['num_problems_updated']}  "
                 f"Skipped: {metrics['num_problems_skipped']}  "
                 f"Rollouts: {total_rollouts_used}  ║")
     logger.info(f"  ╚══════════════════════════════════════════════════════════════════╝")
 
-    # Final cleanup
     torch.cuda.empty_cache()
     gc.collect()
-
     return metrics

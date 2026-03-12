@@ -1,17 +1,12 @@
-"""Modal app: Qwen2.5-7B-Instruct SDPO training on A100-80GB.
+"""Modal app: v1 fresh run with new RAG (lesson + problem summary).
 
-Memory-optimized for 7B:
-- NO reference model (saves ~14GB) — student + teacher only
-- Gradient checkpointing on student
-- Aggressive torch.cuda.empty_cache() between rollouts
-- Smaller batch size (2 problems per SDPO step)
-- 2 rollouts x 4 sequential attempts (instead of 4x4)
-- max_new_tokens=1536 (instead of 2048)
-- Update condition: 100% accuracy only (score >= 0.999)
+Uses a separate volume (cs224n-7b-v1-newrag-results) so it does NOT
+overwrite the existing v1 run (cs224n-7b-results).
+Same config as modal_app_7b.py: 4 attempts, batch 2, etc.
 """
 import modal
 
-app = modal.App("cs224n-7b-sdpo")
+app = modal.App("cs224n-7b-sdpo-v1-newrag")
 
 MODEL_NAME = "Qwen/Qwen2.5-7B-Instruct"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
@@ -49,7 +44,8 @@ image = (
     ])
 )
 
-volume = modal.Volume.from_name("cs224n-7b-results", create_if_missing=True)
+# Separate volume — does NOT touch cs224n-7b-results
+volume = modal.Volume.from_name("cs224n-7b-v1-newrag-results", create_if_missing=True)
 VOLUME_PATH = "/results"
 
 
@@ -102,7 +98,6 @@ def run_training_and_eval(
     torch = _setup_env()
     os.makedirs(f"{VOLUME_PATH}/checkpoints", exist_ok=True)
 
-    # ---- Resume: copy checkpoint from volume BEFORE opening log file ----
     resume_checkpoint_path = None
     resume_rag_path = None
     resume_metrics_path = None
@@ -131,17 +126,16 @@ def run_training_and_eval(
             resume_metrics_path = local_metrics
             print(f"[resume] Copied metrics from {vol_ckpt}/metrics.json")
 
-    # Now safe to open log file on the volume
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(f"{VOLUME_PATH}/training_7b.log"),
+            logging.FileHandler(f"{VOLUME_PATH}/training_7b_v1_newrag.log"),
         ],
         force=True,
     )
-    logger = logging.getLogger("modal_7b")
+    logger = logging.getLogger("modal_7b_v1_newrag")
 
     logger.info(f"CUDA: {torch.cuda.is_available()}")
     if torch.cuda.is_available():
@@ -149,9 +143,8 @@ def run_training_and_eval(
         mem = torch.cuda.get_device_properties(0).total_memory
         logger.info(f"GPU memory: {mem / 1e9:.1f} GB")
 
-    # ---- PHASE 1: Training ----
     logger.info("\n" + "=" * 70)
-    logger.info("PHASE 1: TRAINING (Qwen2.5-7B-Instruct)")
+    logger.info("PHASE 1: TRAINING (v1 NEW RAG - lesson + problem summary)")
     if resume_step > 0:
         logger.info(f"  RESUMING from step {resume_step}")
     logger.info("=" * 70)
@@ -221,7 +214,6 @@ def run_training_and_eval(
     del agent_model
     torch.cuda.empty_cache()
 
-    # ---- PHASE 2: Evaluation ----
     logger.info("\n" + "=" * 70)
     logger.info("PHASE 2: EVALUATION (7B)")
     logger.info("=" * 70)
@@ -269,7 +261,7 @@ def run_eval_only(checkpoint_step: int = 50, num_eval_problems: int = 50,
         handlers=[logging.StreamHandler()],
         force=True,
     )
-    logger = logging.getLogger("modal_eval_7b")
+    logger = logging.getLogger("modal_eval_7b_v1_newrag")
     volume.reload()
 
     vol_model = f"{VOLUME_PATH}/checkpoints/step_{checkpoint_step}/model"
@@ -306,7 +298,7 @@ def run_eval_only(checkpoint_step: int = 50, num_eval_problems: int = 50,
 
 def _print_results(logger, eval_results):
     logger.info("\n" + "#" * 80)
-    logger.info("# 7B RESULTS")
+    logger.info("# 7B v1 NEW RAG RESULTS")
     logger.info("#" * 80)
     logger.info(f"  {'Config':<25} {'Test-Case Acc':>14} {'Solve Rate':>12} {'Correct':>10}")
     logger.info("-" * 80)
@@ -340,17 +332,11 @@ def main(
     checkpoint_every: int = 50,
     resume_step: int = 0,
 ):
-    """7B SDPO training + eval.
-
-    Usage:
-      modal run modal_app_7b.py
-      modal run modal_app_7b.py --lr 1e-6 --ref-kl-beta 0.05
-      modal run modal_app_7b.py --eval-only --checkpoint-step 100
-      modal run modal_app_7b.py --resume-step 250
-    """
+    """Fresh v1 run with new RAG (lesson + problem summary). Uses separate volume."""
     if eval_only:
-        print(f"Launching 7B EVAL-ONLY on A100-80GB...")
-        print(f"  checkpoint_step={checkpoint_step}, num_eval_problems={num_eval_problems}, only_base={only_base}")
+        print("Launching v1 NEW RAG EVAL-ONLY...")
+        print(f"  volume=cs224n-7b-v1-newrag-results")
+        print(f"  checkpoint_step={checkpoint_step}, num_eval_problems={num_eval_problems}")
         result = run_eval_only.remote(
             checkpoint_step=checkpoint_step,
             num_eval_problems=num_eval_problems,
@@ -358,17 +344,9 @@ def main(
             only_base=only_base,
         )
     else:
-        print("Launching 7B TRAINING + EVAL on A100-80GB...")
-        print(f"  model=Qwen2.5-7B-Instruct")
-        print(f"  lr={lr}, ema_rate={ema_rate}, temperature={temperature}")
-        print(f"  num_rollouts={num_rollouts}x{max_sequential_attempts}, "
-              f"sdpo_batch_size={sdpo_batch_size}")
-        print(f"  ref_kl_beta={ref_kl_beta}, alpha={alpha}, topk={distillation_topk}")
-        print(f"  max_new_tokens={max_new_tokens}, max_problems={max_problems}")
-        print(f"  UPDATE CONDITION: 100% accuracy only")
-        if resume_step > 0:
-            print(f"  RESUMING from step {resume_step}")
-        print()
+        print("Launching v1 FRESH TRAINING (new RAG) — separate volume, won't affect current run")
+        print(f"  volume=cs224n-7b-v1-newrag-results")
+        print(f"  max_problems={max_problems}, checkpoint_every={checkpoint_every}")
         result = run_training_and_eval.remote(
             lr=lr, ema_rate=ema_rate,
             num_rollouts=num_rollouts,
@@ -386,10 +364,8 @@ def main(
         )
 
     print("\n" + "=" * 80)
-    print("7B FINAL RESULTS")
+    print("v1 NEW RAG FINAL RESULTS")
     print("=" * 80)
-    print(f"  {'Config':<25} {'Test-Case Acc':>14} {'Solve Rate':>12} {'Correct':>10}")
-    print("-" * 80)
     for key in ["model+rag+sdpo", "base_qwen7b", "model+sdpo"]:
         m = result.get(key, {})
         if "avg_score" in m:
@@ -397,5 +373,3 @@ def main(
                   f"{m['pass_rate']:>12.4f} "
                   f"{m['num_correct']:>5}/{m['num_problems']}")
     print("=" * 80)
-    print("Test-Case Acc = avg fraction of test cases passed per problem")
-    print("Solve Rate    = fraction of problems fully solved (100% test cases)")

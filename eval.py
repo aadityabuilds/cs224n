@@ -66,13 +66,13 @@ def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
         if rag_db and rag_db.size > 0:
             chunks = rag_db.query(description or problem[:500], top_k=config.rag_top_k)
             if chunks:
-                rag_context = "\n\n".join(f"[Knowledge {i+1}]: {c}" for i, c in enumerate(chunks))
+                rag_context = "\n\n".join(f"[Lesson {i+1}]: {c}" for i, c in enumerate(chunks))
                 system_prompt = (
-                    "You are a coding expert. Below are some knowledge snippets retrieved "
-                    "from past problem-solving sessions. They may or may not be relevant to "
-                    "the current problem — only use them if they directly apply.\n\n"
+                    "You are a coding expert. Below are lessons learned from past mistakes "
+                    "on similar problems. Use them to avoid repeating the same errors.\n\n"
                     f"{rag_context}\n\n"
-                    "If none of the above is relevant, ignore it and solve the problem from scratch."
+                    "If none of the above lessons apply to the current problem, ignore them "
+                    "and solve the problem from scratch."
                 )
 
         code_prompt = build_code_prompt(problem, tests_json)

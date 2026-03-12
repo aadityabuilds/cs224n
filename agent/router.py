@@ -21,7 +21,7 @@ After each attempt, you must choose exactly ONE learning action by outputting th
 
 <pass> - Your solution is correct or nearly correct (score >= 0.9). No action needed.
 
-<rag> - Your solution has partial understanding but specific errors (0 < score < 0.9). The feedback contains useful patterns or edge cases worth remembering for future problems.
+<rag> - Your solution has partial understanding but specific errors (0 < score < 0.9). You should store a LESSON about what mistake you made (e.g., off-by-one error, wrong algorithm, missed edge case) so you can avoid it in future similar problems.
 
 <sdpo> - Your solution is fundamentally wrong (score = 0 or very low). You need targeted training on this type of problem to improve your approach.
 
@@ -109,9 +109,14 @@ def _parse_action(text: str) -> str | None:
 
 
 def _build_payload(action: str, feedback: str) -> str | None:
-    """Build the knowledge payload for RAG storage."""
+    """Build a lesson-oriented payload for RAG storage.
+
+    Stores what went wrong (the mistake type) rather than the raw
+    failed solution, so retrieved chunks help avoid errors rather
+    than contaminate with bad code.
+    """
     if action == "rag" and feedback:
-        return f"Common mistake: {feedback[:500]}"
+        return f"Lesson from mistake: {feedback[:500]}"
     return None
 
 
@@ -126,7 +131,7 @@ def rule_based_route(score: float, accuracy: float, feedback: str) -> tuple[str,
         return ("pass", None)
 
     if score > 0:
-        knowledge = f"Common mistake: {feedback[:500]}" if feedback else None
+        knowledge = f"Lesson from mistake: {feedback[:500]}" if feedback else None
         return ("rag", knowledge)
 
     return ("sdpo", None)

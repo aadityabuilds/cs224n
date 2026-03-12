@@ -16,6 +16,20 @@ import logging
 import os
 import sys
 import time
+import numpy as np
+
+
+class _SafeEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, (np.integer,)):
+            return int(o)
+        if isinstance(o, (np.floating,)):
+            return float(o)
+        if isinstance(o, (np.bool_,)):
+            return bool(o)
+        if isinstance(o, np.ndarray):
+            return o.tolist()
+        return super().default(o)
 
 # Make SDPO importable
 SDPO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "SDPO")
@@ -56,15 +70,15 @@ def build_system_prompt_with_rag(rag_db: RAGDatabase, problem_description: str,
         return None, []
     retrieved_ids = [r[0] for r in results]
     rag_context = "\n\n".join(
-        f"[Knowledge {i+1} (id={r[0]}, score={r[2]:.3f})]: {r[1]}"
+        f"[Lesson {i+1} (id={r[0]}, relevance={r[2]:.3f})]: {r[1]}"
         for i, r in enumerate(results)
     )
     prompt = (
-        "You are a coding expert. Below are some knowledge snippets retrieved "
-        "from past problem-solving sessions. They may or may not be relevant to "
-        "the current problem — only use them if they directly apply.\n\n"
+        "You are a coding expert. Below are lessons learned from past mistakes "
+        "on similar problems. Use them to avoid repeating the same errors.\n\n"
         f"{rag_context}\n\n"
-        "If none of the above is relevant, ignore it and solve the problem from scratch."
+        "If none of the above lessons apply to the current problem, ignore them "
+        "and solve the problem from scratch."
     )
     return prompt, retrieved_ids
 
@@ -186,8 +200,8 @@ def run_training_loop(config: AgentConfig, sdpo_config: SelfDistillationConfig =
 
         # ---- Phase 1a-verify: Verify student ----
         result = verify_solution(response, tests_json)
-        score = result["score"]
-        accuracy = result["acc"]
+        score = float(result["score"])
+        accuracy = float(result["acc"])
         feedback = result["feedback"]
 
         total_accuracy += score
@@ -212,7 +226,7 @@ def run_training_loop(config: AgentConfig, sdpo_config: SelfDistillationConfig =
             max_new_tokens=config.max_new_tokens,
         )
         baseline_result = verify_solution(baseline_response, tests_json)
-        baseline_score = baseline_result["score"]
+        baseline_score = float(baseline_result["score"])
         baseline_correct = 1 if baseline_score >= 0.999 else 0
 
         total_baseline_accuracy += baseline_score
@@ -351,7 +365,7 @@ def run_training_loop(config: AgentConfig, sdpo_config: SelfDistillationConfig =
         # Save metrics periodically
         if n % 10 == 0 or n == num_problems:
             with open("training_metrics.json", "w") as f:
-                json.dump(all_metrics, f, indent=2)
+                json.dump(all_metrics, f, indent=2, cls=_SafeEncoder)
 
         # Checkpoint
         if n % config.checkpoint_every == 0 or n == num_problems:
