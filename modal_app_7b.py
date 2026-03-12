@@ -267,16 +267,18 @@ def run_eval_only(checkpoint_step: int = 50, num_eval_problems: int = 50,
 
 
 def _print_results(logger, eval_results):
-    logger.info("\n" + "#" * 70)
+    logger.info("\n" + "#" * 80)
     logger.info("# 7B RESULTS")
-    logger.info("#" * 70)
+    logger.info("#" * 80)
+    logger.info(f"  {'Config':<25} {'Test-Case Acc':>14} {'Solve Rate':>12} {'Correct':>10}")
+    logger.info("-" * 80)
     for key in ["model+rag+sdpo", "base_qwen7b", "model+sdpo"]:
         m = eval_results.get(key, {})
         if "avg_score" in m:
-            logger.info(f"  {m['label']:<25} Score={m['avg_score']:.4f}  "
-                        f"PassRate={m['pass_rate']:.4f}  "
-                        f"Correct={m['num_correct']}/{m['num_problems']}")
-    logger.info("#" * 70)
+            logger.info(f"  {m['label']:<25} {m['avg_score']:>14.4f} "
+                        f"{m['pass_rate']:>12.4f} "
+                        f"{m['num_correct']:>5}/{m['num_problems']}")
+    logger.info("#" * 80)
 
 
 @app.local_entrypoint()
@@ -338,13 +340,17 @@ def main(
             checkpoint_every=checkpoint_every,
         )
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print("7B FINAL RESULTS")
-    print("=" * 70)
+    print("=" * 80)
+    print(f"  {'Config':<25} {'Test-Case Acc':>14} {'Solve Rate':>12} {'Correct':>10}")
+    print("-" * 80)
     for key in ["model+rag+sdpo", "base_qwen7b", "model+sdpo"]:
         m = result.get(key, {})
         if "avg_score" in m:
-            print(f"  {m['label']:<25} Score={m['avg_score']:.4f}  "
-                  f"PassRate={m['pass_rate']:.4f}  "
-                  f"Correct={m['num_correct']}/{m['num_problems']}")
-    print("=" * 70)
+            print(f"  {m['label']:<25} {m['avg_score']:>14.4f} "
+                  f"{m['pass_rate']:>12.4f} "
+                  f"{m['num_correct']:>5}/{m['num_problems']}")
+    print("=" * 80)
+    print("Test-Case Acc = avg fraction of test cases passed per problem")
+    print("Solve Rate    = fraction of problems fully solved (100% test cases)")

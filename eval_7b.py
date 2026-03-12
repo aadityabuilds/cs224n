@@ -68,21 +68,22 @@ def evaluate_model(agent_model, dataset, label, max_problems=50,
 
         result = verify_solution(responses[0], tests_json, split="test")
         score = result["score"]
-        total_accuracy += score
+        acc = result["acc"]
+        total_accuracy += acc
         if score > 0.99:
             total_correct += 1
 
         results.append({
-            "step": idx + 1, "score": score, "acc": result["acc"],
+            "step": idx + 1, "score": score, "acc": acc,
             "feedback": result["feedback"][:200] if result.get("feedback") else "passed",
         })
 
         n = idx + 1
         if n % 5 == 0 or n == num_problems:
             logger.info(f"[{label}] {n}/{num_problems} | "
-                        f"Score: {score:.3f} | "
-                        f"Acc avg: {total_accuracy/n:.3f} | "
-                        f"Solve: {total_correct}/{n}")
+                        f"This: acc={acc:.3f} solved={'YES' if score > 0.99 else 'NO'} | "
+                        f"Test-case acc: {total_accuracy/n:.3f} | "
+                        f"Solve rate: {total_correct}/{n} ({total_correct/n:.3f})")
 
     avg_accuracy = total_accuracy / max(num_problems, 1)
     solve_rate = total_correct / max(num_problems, 1)
@@ -90,15 +91,18 @@ def evaluate_model(agent_model, dataset, label, max_problems=50,
     metrics = {
         "label": label,
         "num_problems": num_problems,
+        "avg_test_case_accuracy": avg_accuracy,
         "avg_score": avg_accuracy,
         "avg_accuracy": avg_accuracy,
+        "solve_rate": solve_rate,
         "pass_rate": solve_rate,
         "num_correct": total_correct,
         "results": results,
     }
 
     logger.info(f"\n--- {label} ---")
-    logger.info(f"  Accuracy: {avg_accuracy:.4f}  Solve: {solve_rate:.4f} ({total_correct}/{num_problems})")
+    logger.info(f"  Test-case accuracy (avg % tests passed): {avg_accuracy:.4f}")
+    logger.info(f"  Solve rate (100% correct):               {solve_rate:.4f} ({total_correct}/{num_problems})")
     return metrics
 
 
@@ -152,16 +156,20 @@ def run_eval_7b(trained_model_path="checkpoints/final_model",
         torch.cuda.empty_cache()
 
     # Print comparison
-    logger.info("\n" + "=" * 70)
+    logger.info("\n" + "=" * 80)
     logger.info("7B COMPARISON")
-    logger.info("=" * 70)
+    logger.info("=" * 80)
+    logger.info(f"  {'Config':<25} {'Test-Case Acc':>14} {'Solve Rate':>12} {'Correct':>10}")
+    logger.info("-" * 80)
     for key in ["model+rag+sdpo", "base_qwen7b", "model+sdpo"]:
         m = all_eval_results.get(key, {})
         if "avg_score" in m:
-            logger.info(f"  {m['label']:<25} Acc={m['avg_score']:.4f}  "
-                        f"Solve={m['pass_rate']:.4f}  "
-                        f"({m['num_correct']}/{m['num_problems']})")
-    logger.info("=" * 70)
+            logger.info(f"  {m['label']:<25} {m['avg_score']:>14.4f} "
+                        f"{m['pass_rate']:>12.4f} "
+                        f"{m['num_correct']:>5}/{m['num_problems']}")
+    logger.info("=" * 80)
+    logger.info("Test-Case Acc = avg fraction of test cases passed per problem")
+    logger.info("Solve Rate    = fraction of problems fully solved (100% test cases)")
 
     with open("eval_results_7b.json", "w") as f:
         json.dump(all_eval_results, f, indent=2, default=str)

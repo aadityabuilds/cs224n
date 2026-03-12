@@ -91,13 +91,13 @@ def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
         for resp in responses:
             result = verify_solution(resp, tests_json, split="test")
             sample_scores.append(result["score"])
-            if result["score"] > best_score:
+            if result["acc"] > best_acc:
                 best_score = result["score"]
                 best_acc = result["acc"]
 
         score = best_score
         acc = best_acc
-        total_accuracy += score
+        total_accuracy += acc
         if score > 0.99:
             total_correct += 1
 
@@ -112,7 +112,7 @@ def evaluate_model(agent_model: AgentModel, dataset, config: AgentConfig,
         n = idx + 1
         if n % 5 == 0 or n == num_problems:
             logger.info(f"[{label}] {n}/{num_problems} | "
-                        f"This: {score:.3f} | "
+                        f"This: acc={acc:.3f} solved={'YES' if score > 0.99 else 'NO'} | "
                         f"Test-case acc: {total_accuracy/n:.3f} | "
                         f"Solve rate: {total_correct}/{n} ({total_correct/n:.3f})")
 
