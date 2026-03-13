@@ -1,6 +1,6 @@
 # Recursive Self-Improvement for Continual Adaptation in Code Generation
 
-CS224N Final Project — Stanford University, Spring 2025
+CS224N Final Project — Stanford University, Winter 2026
 
 **Authors:** Aaditya Nalawade, Chandra Suda, Ethan Goodhart
 
