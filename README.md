@@ -6,6 +6,8 @@ CS224N Final Project — Stanford University, Winter 2026
 
 A self-improving agent that uses Self-Distillation with Policy Optimization (SDPO) and Retrieval-Augmented Generation (RAG) to continually improve on code generation tasks from LiveCodeBench.
 
+<img width="2000" height="1199" alt="image" src="https://github.com/user-attachments/assets/cac9322f-09bc-401d-8dce-9fcb4c2a0977" />
+
 ## Project Structure
 
 ```
